@@ -1,152 +1,1294 @@
 # vps-init
 
-一个面向 **Debian / Ubuntu** 的 VPS 初始化与网络优化脚本：BBR + FQ、TCP 参数调优、文件句柄、RPS、Swap、日志限制、时区与时间同步、常用网络工具，一条命令完成。
+一个面向 **Debian / Ubuntu VPS** 的保守型初始化与网络优化脚本。
 
-设计目标：**非交互、可排查、可回滚、不执行任何第三方二进制。**
+目标不是堆砌所谓的“一键 TCP 神优化参数”，而是提供一套：
 
-## 支持的系统
+* **安全默认值**
+* **可重复执行**
+* **可排查**
+* **可回滚**
+* **配置独立**
+* **不修改系统原始配置**
+* **不下载第三方二进制**
+* **适合长期维护**
 
-| 系统 | 版本 |
-|---|---|
-| Debian | 11 / 12 |
+的 VPS 初始化方案。
+
+核心功能：
+
+> **BBR + FQ + 保守 TCP 参数 + RPS/RFS + nofile + Swap + journald + 时区/NTP + 常用网络工具**
+
+---
+
+## 支持系统
+
+| 系统     | 版本                    |
+| ------ | --------------------- |
+| Debian | 11 / 12               |
 | Ubuntu | 22.04 / 24.04 / 26.04 |
 
-> 仅支持 systemd 系统。CentOS / RHEL 系不在支持范围内。
+要求：
 
-## 快速开始
+* systemd
+* root
+* 使用发行版官方 APT 源
+* 不支持 CentOS / RHEL / Alpine
+* LXC / OpenVZ / Docker 等容器环境可能无法应用部分内核参数
 
-建议先下载、阅读，再运行（不推荐直接 `curl | bash` 以 root 执行未审阅的脚本）：
+脚本会使用 `systemd-detect-virt` 检测虚拟化环境，并在共享内核容器中给出警告。
+
+---
+
+# 快速开始
+
+推荐先下载并检查脚本：
 
 ```bash
-curl -fsSL -o init.sh https://raw.githubusercontent.com/<your-name>/vps-init/main/init.sh
-less init.sh          # 先看一遍
-sudo bash init.sh
+curl -fsSL -o init.sh https://raw.githubusercontent.com/krililrify/bbr/main/init.sh
+less init.sh
 ```
 
-默认模式只做"安全优化"，不会卸载防火墙，也不会卸载云厂商组件。
-
-## 选项（环境变量）
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `TIMEZONE` | `Asia/Shanghai` | 时区 |
-| `ENABLE_FORWARD` | `1` | 开启 IPv4 转发（中转机需要，普通服务器建议设为 `0`） |
-| `ENABLE_RPS` | `1` | 开启 RPS/RFS，多核机器把网卡软中断分散到所有 CPU |
-| `MAKE_SWAP` | `1` | 没有 swap 时创建，大小为 `min(内存, 512MB)` |
-| `STOP_IRQBALANCE` | `0` | 停止 `irqbalance` |
-| `REMOVE_FIREWALL` | `0` | 停用并卸载 ufw / firewalld，并关闭 SELinux |
-| `REMOVE_CLOUD_AGENTS` | `0` | 卸载腾讯云监控组件，停用 waagent / walinuxagent / hypervkvpd |
-| `INSTALL_PACKAGES` | `1` | 安装常用工具包 |
-
-示例：
+确认没有问题后：
 
 ```bash
-# 普通服务器（非中转）
-sudo ENABLE_FORWARD=0 bash init.sh
+chmod +x init.sh
+bash init.sh
+```
 
-# 中转机，并且清理云厂商组件和防火墙
-sudo REMOVE_FIREWALL=1 REMOVE_CLOUD_AGENTS=1 bash init.sh
+或者：
 
-# 查看帮助
+```bash
+bash init.sh
+```
+
+查看帮助：
+
+```bash
 bash init.sh --help
 ```
 
-## 脚本做了什么
+---
 
-1. **安装常用工具**：`curl wget mtr traceroute tcptraceroute nload vnstat htop iftop lsof iperf3 dnsutils ethtool git vim jq` 等。
-2. **文件句柄 / 进程数**：`nofile`/`nproc` 设为 1000000，同时设置 systemd 的 `DefaultLimitNOFILE`，对 systemd 管理的服务也生效。
-3. **BBR + FQ**：加载 `tcp_bbr`，写入 `default_qdisc=fq` 与 `tcp_congestion_control=bbr`。上述系统自带内核均支持 BBR，**不会更换内核**。
-4. **TCP / 网络参数**：缓冲区、backlog、keepalive、`tcp_fastopen`、`tcp_mtu_probing`、关闭 ICMP 重定向、`rp_filter=0` 等。
-5. **IPv4 转发**：开启；**IPv6 转发保持关闭**，避免破坏 DHCP/SLAAC 获取地址。
-6. **RPS / RFS**：自带脚本 + systemd 服务，开机自动应用。
-7. **Swap**：没有 swap 时创建 `/swapfile`。
-8. **journald**：日志最大占用 300MB。
-9. **时区与时间同步**：设置时区；若没有 `systemd-timesyncd` / `chrony` 在运行，则安装 `chrony`。
-10. **别名与函数**：`nload`、`is`（iperf3 服务端）、`ic`（iperf3 客户端）、`dropcache`、`banping` / `unbanping`。
-11. **清理旧版脚本残留**：`rc.local` 中的 `rps.sh` / `rdate` / `sysctl -p` 条目、`/root/rps.sh`、`.bashrc` 中旧别名，以及 `/etc/sysctl.conf` 中与本脚本重复的参数（会覆盖 `sysctl.d`，因此被注释掉）。
-12. **验证汇总**：结束时输出 qdisc、拥塞控制、转发、时区、swap、RPS 等的实际状态。
+# 默认行为
 
-## 和常见"一键优化脚本"的区别
-
-| | 常见脚本 | vps-init |
-|---|---|---|
-| 非交互（不卡在 debconf / needrestart） | ✘ | ✔ |
-| 输出写入日志，便于排查 | ✘（常被 `>/dev/null` 吞掉） | ✔ `/var/log/vps-init.log` |
-| 下载并 root 执行第三方二进制 | 常见 | **无** |
-| 激进操作（卸载防火墙等） | 默认执行 | 默认关闭，需显式开启 |
-| 配置方式 | 覆盖 `sysctl.conf` / `limits.conf` | drop-in 文件，原文件先备份 |
-| 对 systemd 服务生效的 nofile | 常被忽略 | ✔ |
-| 重复执行 | 可能重复追加 | 幂等，并清理旧残留 |
-
-## 文件与改动位置
-
-| 路径 | 用途 |
-|---|---|
-| `/etc/sysctl.d/99-zz-vps-init.conf` | 内核网络参数 |
-| `/etc/security/limits.d/99-vps-init.conf` | 用户级 limits |
-| `/etc/systemd/system.conf.d/99-vps-init.conf` | systemd 默认 limits |
-| `/etc/systemd/journald.conf.d/99-vps-init.conf` | journald 限制 |
-| `/etc/modules-load.d/bbr.conf` | 开机加载 `tcp_bbr` |
-| `/usr/local/sbin/vps-init-rps.sh` | RPS 设置脚本 |
-| `/etc/systemd/system/vps-init-rps.service` | RPS 开机服务 |
-| `/etc/profile.d/99-vps-init.sh` | 别名与函数 |
-| `/swapfile` | Swap（仅在原本没有 swap 时创建） |
-| `/var/log/vps-init.log` | 运行日志 |
-| `/root/init-backup-<时间戳>/` | 修改前的配置备份 |
-
-## 回滚
+直接运行：
 
 ```bash
-# 1. 删除脚本生成的配置
-sudo rm -f /etc/sysctl.d/99-zz-vps-init.conf \
-           /etc/security/limits.d/99-vps-init.conf \
-           /etc/systemd/system.conf.d/99-vps-init.conf \
-           /etc/systemd/journald.conf.d/99-vps-init.conf \
-           /etc/modules-load.d/bbr.conf \
-           /etc/profile.d/99-vps-init.sh
-
-# 2. 停用并删除 RPS 服务
-sudo systemctl disable --now vps-init-rps.service
-sudo rm -f /etc/systemd/system/vps-init-rps.service /usr/local/sbin/vps-init-rps.sh
-
-# 3. 重新加载
-sudo systemctl daemon-reload
-sudo sysctl --system
-
-# 4. 如果修改过 /etc/sysctl.conf，从备份中恢复（被注释的行以 "#disabled-by-vps-init#" 开头）
-ls /root/init-backup-*/etc/
+bash init.sh
 ```
 
-Swap 如需移除：
+默认配置：
+
+```text
+TIMEZONE=Asia/Shanghai
+ENABLE_FORWARD=0
+DISABLE_RP_FILTER=0
+ENABLE_RPS=1
+MAKE_SWAP=1
+SET_LIMITS=1
+STOP_IRQBALANCE=0
+REMOVE_FIREWALL=0
+REMOVE_CLOUD_AGENTS=0
+INSTALL_PACKAGES=1
+JOURNAL_MAX_USE=300M
+```
+
+也就是说：
+
+### 默认会做
+
+* 安装常用网络诊断工具
+* 尝试启用 BBR
+* 设置 FQ
+* 设置保守 TCP 参数
+* 设置 nofile
+* 设置 RPS/RFS
+* 没有 Swap 时创建 128~512 MiB Swap
+* 限制 journald 最大磁盘占用
+* 设置时区
+* 确保存在时间同步服务
+* 清理本项目旧版 RPS 残留
+* 写入一些常用 Shell 命令
+
+### 默认不会做
+
+* 不开启 IPv4 转发
+* 不开启 `route_localnet`
+* 不关闭 `rp_filter`
+* 不关闭防火墙
+* 不卸载云厂商 Agent
+* 不关闭 tuned
+* 不关闭 smartd
+* 不更换内核
+* 不安装第三方内核
+* 不下载第三方二进制
+* 不修改 `/etc/sysctl.conf`
+* 不自动重启服务器
+
+---
+
+# 普通 VPS
+
+普通 Web / Docker / Xray / RustDesk / Chatwoot / Nginx 等服务器：
 
 ```bash
-sudo swapoff /swapfile && sudo rm -f /swapfile && sudo sed -i '\#^/swapfile #d' /etc/fstab
+bash init.sh
 ```
 
-## 注意事项
+这是推荐的默认模式。
 
-- **云厂商安全组**：脚本不会处理云厂商侧的安全组 / 防火墙，请确认 SSH 端口已放行。
-- **`REMOVE_FIREWALL=1` 会降低主机安全性**，公网机器请自行配合云厂商安全组或其它防护。
-- **`rp_filter=0`** 适合中转 / 多网卡 / 非对称路由场景。纯服务器可以在 `/etc/sysctl.d/99-zz-vps-init.conf` 中改为 `1`，但注意重新运行脚本会覆盖该文件。
-- **容器型 VPS（LXC / OpenVZ）**：很多内核参数、内核模块、swap 无法在容器内修改，脚本会给出警告，但不保证全部生效。
-- **已运行的服务**需要重启后才会应用新的文件句柄限制；SSH 需要重新登录。
-- 脚本不会自动重启服务器。
-- 请先在测试机上运行，再用于生产环境。
+---
 
-## 常见问题
+# 中转机 / NAT / VPN
 
-**Q：为什么很多脚本在"安装常用命令"时卡住？**
-通常是 `apt` 弹出了交互界面（`iperf3` 的 debconf 对话框，或 Ubuntu 22.04+ 的 `needrestart` 服务重启提示），但脚本把输出重定向到了 `/dev/null`，看起来就像卡死。本脚本设置了 `DEBIAN_FRONTEND=noninteractive`、`NEEDRESTART_MODE=a`，并把输出写入日志。
+如果服务器需要进行 IPv4 路由转发：
 
-**Q：运行后 BBR 没有生效？**
-在脚本结尾的验证汇总里查看"拥塞控制"一项。常见原因：容器型虚拟化不允许修改；或其它 sysctl 配置覆盖了本脚本（查看 `sysctl -a | grep congestion`，以及 `/etc/sysctl.conf` 和 `/etc/sysctl.d/`）。
+```bash
+ENABLE_FORWARD=1 bash init.sh
+```
 
-**Q：国内机器如何改 NTP 服务器？**
-脚本使用发行版默认的时间同步服务。如需指定，可在 `/etc/systemd/timesyncd.conf.d/` 下添加 `NTP=` 配置，或修改 `/etc/chrony/chrony.conf`。
+例如：
 
-**Q：需要 speedtest / tcping 怎么办？**
-脚本不下载第三方二进制。可使用 `apt install speedtest-cli`，或按 Ookla 官方文档添加其 apt 源。`tcptraceroute` 已默认安装。
+* VPS 中转
+* NAT
+* WireGuard Gateway
+* VPN Gateway
+* 路由器
+* 部分透明代理场景
 
-## 许可证
+IPv4 转发默认关闭，是因为普通 VPS 不需要它。
 
-MIT License。使用前请自行评估风险，**作者不对因运行本脚本造成的任何损失负责**。
+Linux 内核将 `ip_forward` 作为特殊 sysctl 处理，修改它会重置部分 IPv4 配置。因此本脚本在生成 sysctl 文件时，会先设置 `ip_forward`，再设置其它 IPv4 参数。
+
+---
+
+# 非对称路由 / 多网卡
+
+普通 VPS 默认：
+
+```text
+rp_filter=1
+```
+
+如果服务器属于：
+
+* 多网卡
+* 非对称路由
+* 特殊中转
+* 多出口
+* 某些 VPN / Relay
+* 特殊策略路由
+
+可以：
+
+```bash
+ENABLE_FORWARD=1 DISABLE_RP_FILTER=1 bash init.sh
+```
+
+此时：
+
+```text
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+```
+
+不要为了“优化”而无条件关闭 `rp_filter`。
+
+---
+
+# BBR + FQ
+
+脚本会首先尝试加载：
+
+```text
+tcp_bbr
+```
+
+然后检测：
+
+```text
+/proc/sys/net/ipv4/tcp_available_congestion_control
+```
+
+如果当前内核支持 BBR：
+
+```text
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+```
+
+同时生成：
+
+```text
+/etc/modules-load.d/bbr.conf
+```
+
+保证后续启动时继续尝试加载 BBR。
+
+脚本不会：
+
+* 下载第三方内核
+* 更换内核
+* 修改 GRUB
+* 安装第三方 BBR 模块
+
+如果当前 VPS 内核本身不支持 BBR，脚本只会给出警告。
+
+---
+
+# 为什么不再使用大量“激进 TCP 参数”
+
+本项目故意没有使用很多常见的一键优化参数，例如：
+
+```text
+tcp_retries2=8
+tcp_orphan_retries=2
+tcp_tw_reuse=1
+tcp_no_metrics_save=1
+tcp_fin_timeout=15
+```
+
+这些参数并不是“越小越快”。
+
+例如 Linux 当前内核文档中：
+
+* `tcp_retries2` 默认值为 15
+* `tcp_orphan_retries` 默认值为 8
+* `tcp_tw_reuse` 当前默认值为 2
+
+并且内核文档特别提醒 `tcp_tw_reuse` 不应在没有专业建议的情况下随意修改。
+
+因此本项目选择：
+
+> **只调整比较明确、可解释、适合作为通用 VPS 默认值的参数。**
+
+---
+
+# TCP 参数
+
+当前主要设置：
+
+```text
+tcp_syncookies=1
+tcp_fastopen=3
+tcp_mtu_probing=1
+tcp_slow_start_after_idle=0
+tcp_window_scaling=1
+tcp_sack=1
+tcp_moderate_rcvbuf=1
+```
+
+以及：
+
+```text
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=16384
+net.ipv4.tcp_max_syn_backlog=16384
+```
+
+TCP buffer 上限：
+
+```text
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+
+net.ipv4.tcp_rmem=4096 131072 33554432
+net.ipv4.tcp_wmem=4096 16384 33554432
+```
+
+这些是上限/自动调节范围，并不是启动时一次性分配几十 MB 内存。
+
+---
+
+# TCP MTU Probing
+
+脚本：
+
+```text
+net.ipv4.tcp_mtu_probing=1
+```
+
+这个模式不是强制所有 TCP 连接持续探测 MTU，而是在检测到可能的 ICMP black hole 时启用相关机制。
+
+对于 VPS、跨境线路、隧道、中转等场景，这比强制模式更保守。
+
+---
+
+# RPS / RFS
+
+默认：
+
+```text
+ENABLE_RPS=1
+```
+
+但不是无脑把所有网卡都分配给所有 CPU。
+
+脚本会检查：
+
+```text
+CPU 数量
+RX queue 数量
+```
+
+如果：
+
+```text
+RX queue >= CPU
+```
+
+则认为硬件 RSS 已经有足够的并行队列，避免额外增加软件 RPS 开销。
+
+只有在软件分流可能有意义时，才设置：
+
+```text
+rps_cpus
+rps_flow_cnt
+```
+
+RPS 配置脚本：
+
+```text
+/usr/local/sbin/vps-init-rps.sh
+```
+
+systemd 服务：
+
+```text
+/etc/systemd/system/vps-init-rps.service
+```
+
+查看状态：
+
+```bash
+systemctl status vps-init-rps.service
+```
+
+关闭：
+
+```bash
+ENABLE_RPS=0 bash init.sh
+```
+
+---
+
+# 文件句柄
+
+默认：
+
+```text
+SET_LIMITS=1
+```
+
+生成：
+
+```text
+/etc/security/limits.d/99-vps-init.conf
+```
+
+主要配置：
+
+```text
+*     soft   nofile    1000000
+*     hard   nofile    1000000
+root  soft   nofile    1000000
+root  hard   nofile    1000000
+```
+
+同时为 systemd 写入：
+
+```text
+/etc/systemd/system.conf.d/99-vps-init.conf
+```
+
+配置：
+
+```ini
+[Manager]
+DefaultLimitNOFILE=1000000
+```
+
+这样 PAM 登录会话和 systemd 默认启动的服务都可以获得更高的文件描述符上限。
+
+注意：
+
+> 已经运行的服务不会因为写入配置文件而自动改变限制。
+
+例如 Docker / Nginx / Xray 等已经运行的服务，通常需要重启后才能继承新的 systemd 默认限制。
+
+新 SSH 登录：
+
+```bash
+ulimit -n
+```
+
+查看。
+
+---
+
+# Swap
+
+默认：
+
+```text
+MAKE_SWAP=1
+```
+
+如果系统已经存在 Swap：
+
+```text
+跳过
+```
+
+如果没有：
+
+```text
+128~512 MiB
+```
+
+具体大小根据物理内存计算：
+
+|          内存 |    Swap |
+| ----------: | ------: |
+|    <128 MiB | 128 MiB |
+| 128~512 MiB |   与内存接近 |
+|    >512 MiB | 512 MiB |
+
+Swap 文件：
+
+```text
+/swapfile
+```
+
+权限：
+
+```text
+600
+```
+
+并自动写入：
+
+```text
+/etc/fstab
+```
+
+如果不想创建：
+
+```bash
+MAKE_SWAP=0 bash init.sh
+```
+
+---
+
+# journald
+
+默认：
+
+```text
+300M
+```
+
+生成：
+
+```text
+/etc/systemd/journald.conf.d/99-vps-init.conf
+```
+
+内容：
+
+```ini
+[Journal]
+SystemMaxUse=300M
+```
+
+目的主要是防止长期运行 VPS 的 journal 无限膨胀。
+
+可以自定义：
+
+```bash
+JOURNAL_MAX_USE=500M bash init.sh
+```
+
+或者：
+
+```bash
+JOURNAL_MAX_USE=1G bash init.sh
+```
+
+---
+
+# 时区
+
+默认：
+
+```text
+Asia/Shanghai
+```
+
+例如：
+
+```bash
+TIMEZONE=Asia/Tokyo bash init.sh
+```
+
+或者：
+
+```bash
+TIMEZONE=UTC bash init.sh
+```
+
+---
+
+# 时间同步
+
+脚本首先检查：
+
+```text
+systemd-timesyncd
+chrony
+chronyd
+```
+
+如果已经存在并运行：
+
+> 不重复安装。
+
+如果没有：
+
+> 使用发行版官方 APT 源安装 chrony。
+
+不会下载第三方 NTP 软件。
+
+---
+
+# 常用工具
+
+默认尝试安装：
+
+```text
+curl
+wget
+ca-certificates
+
+iproute2
+iputils-ping
+net-tools
+ethtool
+
+mtr-tiny
+traceroute
+tcptraceroute
+
+nload
+vnstat
+htop
+iftop
+lsof
+
+dnsutils
+iperf3
+
+git
+vim
+jq
+unzip
+```
+
+如果某个发行版仓库没有某个包，会跳过该包，而不是因为一个包失败导致整个安装流程完全中断。
+
+---
+
+# Shell 辅助命令
+
+脚本生成：
+
+```text
+/etc/profile.d/99-vps-init.sh
+```
+
+包含：
+
+### nload
+
+```bash
+nload
+```
+
+### iperf3 服务端
+
+```bash
+is
+```
+
+等价于：
+
+```bash
+iperf3 -s
+```
+
+### iperf3 客户端
+
+```bash
+ic IP
+```
+
+等价于：
+
+```bash
+iperf3 -c IP
+```
+
+### 清理缓存
+
+```bash
+dropcache
+```
+
+### 禁止 Ping
+
+```bash
+banping
+```
+
+### 恢复 Ping
+
+```bash
+unbanping
+```
+
+这些命令不是初始化必须项，只是方便日常 VPS 管理。
+
+---
+
+# 防火墙
+
+默认：
+
+```text
+REMOVE_FIREWALL=0
+```
+
+所以：
+
+> 脚本不会碰现有防火墙。
+
+不会自动：
+
+```text
+卸载 ufw
+卸载 firewalld
+关闭 nftables
+修改 iptables
+修改云安全组
+```
+
+如果明确需要卸载：
+
+```bash
+REMOVE_FIREWALL=1 bash init.sh
+```
+
+这属于危险选项。
+
+公网服务器使用之前，请确保：
+
+* 云厂商安全组已经配置
+* SSH 端口已经放行
+* 服务器有其它防护措施
+
+---
+
+# 云厂商 Agent
+
+默认：
+
+```text
+REMOVE_CLOUD_AGENTS=0
+```
+
+因此：
+
+> 不处理云厂商组件。
+
+如果明确需要：
+
+```bash
+REMOVE_CLOUD_AGENTS=1 bash init.sh
+```
+
+目前主要处理脚本明确识别到的：
+
+```text
+walinuxagent
+waagent
+hypervkvpd
+```
+
+以及部分腾讯云：
+
+```text
+/usr/local/qcloud
+```
+
+相关卸载程序。
+
+注意：
+
+> `REMOVE_CLOUD_AGENTS=1` 不等于“删除所有云厂商监控”。
+
+不同云厂商使用的 Agent 不一样。
+
+例如本脚本不会把阿里云的所有监控/安全组件都当作统一对象删除。
+
+---
+
+# irqbalance
+
+默认：
+
+```text
+STOP_IRQBALANCE=0
+```
+
+也就是说：
+
+> 保留 irqbalance。
+
+如果你明确知道自己的 VPS 不需要：
+
+```bash
+STOP_IRQBALANCE=1 bash init.sh
+```
+
+才会尝试停用。
+
+---
+
+# tuned / smartd
+
+本版本**不会默认关闭**：
+
+```text
+tuned
+smartd
+```
+
+这是刻意设计。
+
+如果 VPS 已经安装这些服务：
+
+> 说明它们可能是系统或用户主动配置的一部分。
+
+初始化脚本不应该擅自删除或关闭。
+
+---
+
+# 配置文件
+
+主要文件：
+
+```text
+/etc/sysctl.d/99-zz-vps-init.conf
+/etc/security/limits.d/99-vps-init.conf
+/etc/systemd/system.conf.d/99-vps-init.conf
+/etc/systemd/journald.conf.d/99-vps-init.conf
+/etc/modules-load.d/bbr.conf
+
+/usr/local/sbin/vps-init-rps.sh
+/etc/systemd/system/vps-init-rps.service
+
+/etc/profile.d/99-vps-init.sh
+```
+
+日志：
+
+```text
+/var/log/vps-init.log
+```
+
+备份：
+
+```text
+/root/vps-init-backup-YYYYMMDD-HHMMSS/
+```
+
+---
+
+# 为什么使用 sysctl.d
+
+本项目不会把大量参数直接追加到：
+
+```text
+/etc/sysctl.conf
+```
+
+而是使用：
+
+```text
+/etc/sysctl.d/99-zz-vps-init.conf
+```
+
+这样：
+
+* 配置集中
+* 容易查看
+* 容易删除
+* 不污染系统原始配置
+* 可以通过文件名控制优先级
+
+Linux 的 `sysctl.d` 会按照文件名排序，同名配置由优先级更高的位置覆盖；本项目使用 `99-zz-vps-init.conf`，目的是让本地管理员配置拥有较明确的覆盖空间，同时避免直接修改发行版的 `/etc/sysctl.conf`。
+
+---
+
+# 日志
+
+运行日志：
+
+```bash
+cat /var/log/vps-init.log
+```
+
+实时查看：
+
+```bash
+tail -f /var/log/vps-init.log
+```
+
+只看最后 100 行：
+
+```bash
+tail -n 100 /var/log/vps-init.log
+```
+
+如果脚本出现：
+
+```text
+[WARN]
+```
+
+或者：
+
+```text
+[ERR]
+```
+
+优先查看：
+
+```bash
+/var/log/vps-init.log
+```
+
+---
+
+# 验证
+
+脚本结束时会自动检查：
+
+```text
+qdisc
+BBR
+IPv4 forwarding
+IPv6 forwarding
+rp_filter
+TCP Fast Open
+TCP MTU probing
+时区
+Swap
+nofile 配置
+RPS 服务
+journald
+```
+
+例如：
+
+```text
+✔ 默认 qdisc: fq
+✔ 拥塞控制: bbr
+✔ IPv4 转发: 0
+✔ IPv6 转发: 0
+✔ rp_filter: 1
+✔ tcp_fastopen: 3
+✔ tcp_mtu_probing: 1
+✔ 时区: Asia/Shanghai
+```
+
+---
+
+# 手动检查 BBR
+
+```bash
+sysctl net.ipv4.tcp_congestion_control
+```
+
+应该：
+
+```text
+net.ipv4.tcp_congestion_control = bbr
+```
+
+查看可用拥塞控制：
+
+```bash
+sysctl net.ipv4.tcp_available_congestion_control
+```
+
+查看 qdisc：
+
+```bash
+sysctl net.core.default_qdisc
+```
+
+应该：
+
+```text
+net.core.default_qdisc = fq
+```
+
+---
+
+# 手动检查 RPS
+
+查看服务：
+
+```bash
+systemctl status vps-init-rps.service
+```
+
+查看：
+
+```bash
+cat /sys/class/net/eth0/queues/rx-0/rps_cpus
+```
+
+注意实际网卡名称可能不是 `eth0`：
+
+```bash
+ip link
+```
+
+---
+
+# 手动检查文件句柄
+
+当前 SSH：
+
+```bash
+ulimit -n
+```
+
+systemd 默认：
+
+```bash
+systemctl show --property=DefaultLimitNOFILE
+```
+
+单个服务：
+
+```bash
+systemctl show nginx --property=LimitNOFILE
+```
+
+已经运行的服务如果没有继承新的限制，可以：
+
+```bash
+systemctl restart nginx
+```
+
+---
+
+# 回滚
+
+本脚本所有主要配置都有独立文件，因此回滚比较简单。
+
+## 1. 删除 sysctl
+
+```bash
+rm -f /etc/sysctl.d/99-zz-vps-init.conf
+```
+
+然后：
+
+```bash
+systemctl restart systemd-sysctl
+```
+
+注意：
+
+> 如果系统当前运行状态需要立即恢复到原来的参数，建议从备份或系统默认配置中恢复，而不是单纯删除文件后假设所有 runtime 参数会自动恢复。
+
+---
+
+## 2. 删除 BBR modules-load
+
+```bash
+rm -f /etc/modules-load.d/bbr.conf
+```
+
+BBR 本身不需要为了回滚而更换内核。
+
+---
+
+## 3. 删除 RPS
+
+```bash
+systemctl disable --now vps-init-rps.service
+```
+
+然后：
+
+```bash
+rm -f \
+  /etc/systemd/system/vps-init-rps.service \
+  /usr/local/sbin/vps-init-rps.sh
+```
+
+最后：
+
+```bash
+systemctl daemon-reload
+```
+
+---
+
+## 4. 删除 limits
+
+```bash
+rm -f \
+  /etc/security/limits.d/99-vps-init.conf \
+  /etc/systemd/system.conf.d/99-vps-init.conf
+```
+
+然后：
+
+```bash
+systemctl daemon-reload
+```
+
+重新登录 SSH。
+
+---
+
+## 5. 删除 journald 配置
+
+```bash
+rm -f /etc/systemd/journald.conf.d/99-vps-init.conf
+systemctl restart systemd-journald
+```
+
+---
+
+## 6. 删除 Shell 辅助命令
+
+```bash
+rm -f /etc/profile.d/99-vps-init.sh
+```
+
+重新登录 SSH。
+
+---
+
+## 7. 删除 Swap
+
+只有确认 `/swapfile` 是本项目创建的情况下：
+
+```bash
+swapoff /swapfile
+rm -f /swapfile
+sed -i '\#^/swapfile[[:space:]]#d' /etc/fstab
+```
+
+---
+
+# 自动备份
+
+每次运行都会创建：
+
+```text
+/root/vps-init-backup-YYYYMMDD-HHMMSS/
+```
+
+例如：
+
+```text
+/root/vps-init-backup-20261001-162500/
+```
+
+如果某个系统文件在修改前存在，脚本会优先备份。
+
+查看：
+
+```bash
+ls -lah /root/vps-init-backup-*/
+```
+
+---
+
+# 重复执行
+
+脚本设计为幂等。
+
+可以重复运行：
+
+```bash
+bash init.sh
+```
+
+不会不断追加：
+
+```text
+limits
+aliases
+sysctl
+RPS service
+journald
+```
+
+而是重新生成本项目自己的配置文件。
+
+例如：
+
+```bash
+bash init.sh
+bash init.sh
+bash init.sh
+```
+
+不会生成：
+
+```text
+alias nload=...
+alias nload=...
+alias nload=...
+```
+
+---
+
+# 推荐使用方式
+
+## 普通 VPS
+
+```bash
+bash init.sh
+```
+
+## 中转 VPS
+
+```bash
+ENABLE_FORWARD=1 bash init.sh
+```
+
+## 中转 + 非对称路由
+
+```bash
+ENABLE_FORWARD=1 DISABLE_RP_FILTER=1 bash init.sh
+```
+
+## 不创建 Swap
+
+```bash
+MAKE_SWAP=0 bash init.sh
+```
+
+## 不使用 RPS
+
+```bash
+ENABLE_RPS=0 bash init.sh
+```
+
+## 不安装工具
+
+```bash
+INSTALL_PACKAGES=0 bash init.sh
+```
+
+## UTC
+
+```bash
+TIMEZONE=UTC bash init.sh
+```
+
+## 东京
+
+```bash
+TIMEZONE=Asia/Tokyo bash init.sh
+```
+
+---
+
+# 设计原则
+
+本项目不追求：
+
+> “sysctl 参数越多越快”。
+
+而是遵循：
+
+> **默认保守，特殊需求通过环境变量开启。**
+
+尤其不默认修改：
+
+```text
+tcp_retries2
+tcp_orphan_retries
+tcp_tw_reuse
+tcp_no_metrics_save
+route_localnet
+```
+
+也不默认：
+
+```text
+关闭 rp_filter
+开启 IPv4 forwarding
+卸载防火墙
+卸载云厂商 Agent
+关闭 tuned
+关闭 smartd
+更换 Linux 内核
+```
+
+这样同一个脚本可以用于：
+
+```text
+普通 Web VPS
+Docker VPS
+Xray VPS
+中转 VPS
+VPN VPS
+RustDesk VPS
+Nginx VPS
+数据库 VPS
+```
+
+而不需要为了不同机器维护大量完全不同的一键脚本。
+
+---
+
+# 安全说明
+
+这是一个系统初始化脚本。
+
+执行前请确认：
+
+1. SSH 当前可以正常登录。
+2. 云厂商安全组已经放行 SSH。
+3. 不要在不了解 `REMOVE_FIREWALL=1` 后果的情况下使用它。
+4. 中转机才需要开启 `ENABLE_FORWARD=1`。
+5. 非对称路由场景才考虑 `DISABLE_RP_FILTER=1`。
+6. 容器 VPS 可能不允许修改部分内核参数。
+7. 脚本不会自动重启服务器。
+
+建议：
+
+> **先在测试 VPS 上执行，再用于生产服务器。**
+
+---
+
+# License
+
+MIT License
+
+本项目仅提供系统配置自动化。
+
+使用前请自行评估服务器环境和业务需求。
