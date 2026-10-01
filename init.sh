@@ -123,7 +123,7 @@ esac
 }
 
 mkdir -p "$(dirname "$LOG")" "$BACKUP_DIR"
-:"$LOG"
+: >"$LOG"
 
 # 防止多个实例同时修改 sysctl / systemd 配置
 exec 9>/run/lock/vps-init.lock
