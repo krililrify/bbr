@@ -1,530 +1,152 @@
-````markdown
-# VPS Init & Network Optimization
+# vps-init
 
-VPS 一键初始化与网络优化脚本。
+一个面向 **Debian / Ubuntu** 的 VPS 初始化与网络优化脚本：BBR + FQ、TCP 参数调优、文件句柄、RPS、Swap、日志限制、时区与时间同步、常用网络工具，一条命令完成。
 
-主要用于 Debian / Ubuntu / CentOS VPS 的系统初始化、BBR、TCP 网络参数优化以及常用网络工具安装。
+设计目标：**非交互、可排查、可回滚、不执行任何第三方二进制。**
 
-## 使用方式
+## 支持的系统
 
-直接执行：
+| 系统 | 版本 |
+|---|---|
+| Debian | 11 / 12 |
+| Ubuntu | 22.04 / 24.04 / 26.04 |
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/newxqkjfenxiang/docker-install/main/inits.sh | bash
-````
+> 仅支持 systemd 系统。CentOS / RHEL 系不在支持范围内。
 
-如果当前用户不是 `root`，请使用：
+## 快速开始
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/newxqkjfenxiang/docker-install/main/inits.sh | sudo bash
-```
-
-也可以先下载再执行：
+建议先下载、阅读，再运行（不推荐直接 `curl | bash` 以 root 执行未审阅的脚本）：
 
 ```bash
-wget -O inits.sh https://raw.githubusercontent.com/newxqkjfenxiang/docker-install/main/inits.sh
-chmod +x inits.sh
-bash inits.sh
+curl -fsSL -o init.sh https://raw.githubusercontent.com/<your-name>/vps-init/main/init.sh
+less init.sh          # 先看一遍
+sudo bash init.sh
 ```
 
----
+默认模式只做"安全优化"，不会卸载防火墙，也不会卸载云厂商组件。
 
-## 功能特性
+## 选项（环境变量）
 
-### 系统初始化
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `TIMEZONE` | `Asia/Shanghai` | 时区 |
+| `ENABLE_FORWARD` | `1` | 开启 IPv4 转发（中转机需要，普通服务器建议设为 `0`） |
+| `ENABLE_RPS` | `1` | 开启 RPS/RFS，多核机器把网卡软中断分散到所有 CPU |
+| `MAKE_SWAP` | `1` | 没有 swap 时创建，大小为 `min(内存, 512MB)` |
+| `STOP_IRQBALANCE` | `0` | 停止 `irqbalance` |
+| `REMOVE_FIREWALL` | `0` | 停用并卸载 ufw / firewalld，并关闭 SELinux |
+| `REMOVE_CLOUD_AGENTS` | `0` | 卸载腾讯云监控组件，停用 waagent / walinuxagent / hypervkvpd |
+| `INSTALL_PACKAGES` | `1` | 安装常用工具包 |
 
-* ✅ 自动检测 Root 权限
-* ✅ 自动检测操作系统
-* ✅ 自动检测 CPU 架构
-* ✅ 支持 Debian / Ubuntu / CentOS
-* ✅ 更新系统软件包索引
-* ✅ 优化文件句柄与进程限制
-
-### 防火墙与云服务处理
-
-* ⚠️ 自动停止并卸载 firewalld
-* ⚠️ 自动停止并卸载 UFW
-* ⚠️ 停止部分不必要的系统服务
-* ⚠️ 检测并卸载腾讯云相关 Agent
-
-### BBR
-
-* ✅ 自动检测 Linux Kernel
-* ✅ 自动加载 tcp_bbr
-* ✅ 检查系统是否支持 BBR
-* ✅ 启用 BBR
-* ✅ 启用 FQ
-* ✅ 配置：
-
-```text
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-```
-
-安装完成后可以检查：
+示例：
 
 ```bash
-sysctl net.core.default_qdisc
-sysctl net.ipv4.tcp_congestion_control
-sysctl net.ipv4.tcp_available_congestion_control
+# 普通服务器（非中转）
+sudo ENABLE_FORWARD=0 bash init.sh
+
+# 中转机，并且清理云厂商组件和防火墙
+sudo REMOVE_FIREWALL=1 REMOVE_CLOUD_AGENTS=1 bash init.sh
+
+# 查看帮助
+bash init.sh --help
 ```
 
-正常情况下应该看到：
-
-```text
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-```
-
-并且可用算法中包含：
-
-```text
-bbr
-```
-
----
-
-## TCP 网络优化
-
-脚本包含以下 TCP 参数优化：
-
-```text
-net.ipv4.tcp_no_metrics_save
-net.ipv4.tcp_ecn
-net.ipv4.tcp_frto
-net.ipv4.tcp_mtu_probing
-net.ipv4.tcp_rfc1337
-net.ipv4.tcp_sack
-net.ipv4.tcp_fack
-net.ipv4.tcp_window_scaling
-net.ipv4.tcp_adv_win_scale
-net.ipv4.tcp_moderate_rcvbuf
-net.ipv4.tcp_syncookies
-net.ipv4.tcp_nopush
-net.ipv4.tcp_dsack
-net.ipv4.tcp_fastopen
-net.ipv4.tcp_tw_reuse
-net.ipv4.tcp_timestamps
-```
-
-### TCP Buffer
-
-```text
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-```
-
-### TCP Queue
-
-```text
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
-```
-
-### TCP Port
-
-```text
-net.ipv4.ip_local_port_range = 1024 65535
-```
-
----
-
-## IPv4 Forwarding
-
-默认开启：
-
-```text
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.forwarding = 1
-net.ipv4.conf.default.forwarding = 1
-```
-
-适用于：
-
-* VPS 中转
-* NAT
-* 路由
-* 代理
-* 网络转发
-
-同时关闭 IPv4 `rp_filter`：
-
-```text
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
-```
-
----
-
-## IPv6
-
-脚本不会关闭 IPv6。
-
-默认：
-
-```text
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
-```
-
-但是不会开启 IPv6 forwarding：
-
-```text
-net.ipv6.conf.all.forwarding = 0
-net.ipv6.conf.default.forwarding = 0
-```
-
----
-
-## RPS
-
-自动下载并配置 RPS：
-
-```text
-https://file.myluckys.org/script/rps.sh
-```
-
-配置完成后：
-
-```text
-/root/rps.sh
-```
-
-并加入 `/etc/rc.local`，服务器启动后自动执行。
-
----
-
-## Swap
-
-如果 VPS 没有 Swap：
-
-* 自动创建 `/swapfile`
-* 根据内存自动计算大小
-* 最大 512 MB
-* 最小 128 MB
-* 自动加入 `/etc/fstab`
-
-如果已经存在 Swap，则不会重复创建。
-
----
-
-## irqbalance
-
-脚本会检测并停止：
-
-```text
-irqbalance
-```
-
-并设置为不开机启动。
-
----
-
-## systemd 日志
-
-限制 systemd journal 最大使用空间：
-
-```text
-300 MB
-```
-
-配置文件：
-
-```text
-/etc/systemd/journald.conf.d/99-vps-init.conf
-```
-
----
-
-## 时区与时间同步
-
-默认设置服务器时区：
-
-```text
-Asia/Shanghai
-```
-
-安装：
-
-```text
-rdate
-```
-
-并使用：
-
-```text
-time.nist.gov
-```
-
-进行时间同步。
-
----
-
-## 常用网络工具
-
-自动安装：
-
-```text
-iperf3
-mtr
-traceroute
-nload
-vnstat
-curl
-wget
-lsof
-htop
-iftop
-telnet
-git
-dnsutils
-net-tools
-vim
-nano
-tcptraceroute
-```
-
----
-
-## tcping
-
-自动安装：
-
-```text
-/usr/bin/tcping
-```
-
-来源：
-
-```text
-https://file.myluckys.org/script/tcping
-```
-
----
-
-## speedtest
-
-根据 CPU 架构自动安装：
-
-```text
-/usr/bin/speedtest
-```
-
-支持：
-
-```text
-x86_64
-aarch64
-```
-
----
-
-## Bash Alias
-
-自动添加以下快捷命令。
-
-### nload
+## 脚本做了什么
+
+1. **安装常用工具**：`curl wget mtr traceroute tcptraceroute nload vnstat htop iftop lsof iperf3 dnsutils ethtool git vim jq` 等。
+2. **文件句柄 / 进程数**：`nofile`/`nproc` 设为 1000000，同时设置 systemd 的 `DefaultLimitNOFILE`，对 systemd 管理的服务也生效。
+3. **BBR + FQ**：加载 `tcp_bbr`，写入 `default_qdisc=fq` 与 `tcp_congestion_control=bbr`。上述系统自带内核均支持 BBR，**不会更换内核**。
+4. **TCP / 网络参数**：缓冲区、backlog、keepalive、`tcp_fastopen`、`tcp_mtu_probing`、关闭 ICMP 重定向、`rp_filter=0` 等。
+5. **IPv4 转发**：开启；**IPv6 转发保持关闭**，避免破坏 DHCP/SLAAC 获取地址。
+6. **RPS / RFS**：自带脚本 + systemd 服务，开机自动应用。
+7. **Swap**：没有 swap 时创建 `/swapfile`。
+8. **journald**：日志最大占用 300MB。
+9. **时区与时间同步**：设置时区；若没有 `systemd-timesyncd` / `chrony` 在运行，则安装 `chrony`。
+10. **别名与函数**：`nload`、`is`（iperf3 服务端）、`ic`（iperf3 客户端）、`dropcache`、`banping` / `unbanping`。
+11. **清理旧版脚本残留**：`rc.local` 中的 `rps.sh` / `rdate` / `sysctl -p` 条目、`/root/rps.sh`、`.bashrc` 中旧别名，以及 `/etc/sysctl.conf` 中与本脚本重复的参数（会覆盖 `sysctl.d`，因此被注释掉）。
+12. **验证汇总**：结束时输出 qdisc、拥塞控制、转发、时区、swap、RPS 等的实际状态。
+
+## 和常见"一键优化脚本"的区别
+
+| | 常见脚本 | vps-init |
+|---|---|---|
+| 非交互（不卡在 debconf / needrestart） | ✘ | ✔ |
+| 输出写入日志，便于排查 | ✘（常被 `>/dev/null` 吞掉） | ✔ `/var/log/vps-init.log` |
+| 下载并 root 执行第三方二进制 | 常见 | **无** |
+| 激进操作（卸载防火墙等） | 默认执行 | 默认关闭，需显式开启 |
+| 配置方式 | 覆盖 `sysctl.conf` / `limits.conf` | drop-in 文件，原文件先备份 |
+| 对 systemd 服务生效的 nofile | 常被忽略 | ✔ |
+| 重复执行 | 可能重复追加 | 幂等，并清理旧残留 |
+
+## 文件与改动位置
+
+| 路径 | 用途 |
+|---|---|
+| `/etc/sysctl.d/99-zz-vps-init.conf` | 内核网络参数 |
+| `/etc/security/limits.d/99-vps-init.conf` | 用户级 limits |
+| `/etc/systemd/system.conf.d/99-vps-init.conf` | systemd 默认 limits |
+| `/etc/systemd/journald.conf.d/99-vps-init.conf` | journald 限制 |
+| `/etc/modules-load.d/bbr.conf` | 开机加载 `tcp_bbr` |
+| `/usr/local/sbin/vps-init-rps.sh` | RPS 设置脚本 |
+| `/etc/systemd/system/vps-init-rps.service` | RPS 开机服务 |
+| `/etc/profile.d/99-vps-init.sh` | 别名与函数 |
+| `/swapfile` | Swap（仅在原本没有 swap 时创建） |
+| `/var/log/vps-init.log` | 运行日志 |
+| `/root/init-backup-<时间戳>/` | 修改前的配置备份 |
+
+## 回滚
 
 ```bash
-nload
+# 1. 删除脚本生成的配置
+sudo rm -f /etc/sysctl.d/99-zz-vps-init.conf \
+           /etc/security/limits.d/99-vps-init.conf \
+           /etc/systemd/system.conf.d/99-vps-init.conf \
+           /etc/systemd/journald.conf.d/99-vps-init.conf \
+           /etc/modules-load.d/bbr.conf \
+           /etc/profile.d/99-vps-init.sh
+
+# 2. 停用并删除 RPS 服务
+sudo systemctl disable --now vps-init-rps.service
+sudo rm -f /etc/systemd/system/vps-init-rps.service /usr/local/sbin/vps-init-rps.sh
+
+# 3. 重新加载
+sudo systemctl daemon-reload
+sudo sysctl --system
+
+# 4. 如果修改过 /etc/sysctl.conf，从备份中恢复（被注释的行以 "#disabled-by-vps-init#" 开头）
+ls /root/init-backup-*/etc/
 ```
 
-### iperf3 Server
+Swap 如需移除：
 
 ```bash
-is
+sudo swapoff /swapfile && sudo rm -f /swapfile && sudo sed -i '\#^/swapfile #d' /etc/fstab
 ```
-
-等价于：
-
-```bash
-iperf3 -s
-```
-
-### iperf3 Client
-
-```bash
-ic
-```
-
-等价于：
-
-```bash
-iperf3 -c
-```
-
-### 清理缓存
-
-```bash
-dropcache
-```
-
-### 禁止 Ping
-
-```bash
-banping
-```
-
-### 恢复 Ping
-
-```bash
-unbanping
-```
-
-### SKY-BOX
-
-```bash
-tbox
-```
-
----
-
-## sysctl 配置
-
-脚本会备份原有配置：
-
-```text
-/root/sysctl-backup-时间/
-```
-
-然后重新生成：
-
-```text
-/etc/sysctl.conf
-```
-
-同时清理：
-
-```text
-/etc/sysctl.d/*.conf
-```
-
-这样可以避免多个 sysctl 配置文件之间出现重复或参数覆盖。
-
----
 
 ## 注意事项
 
-### 1. 必须使用 Root
+- **云厂商安全组**：脚本不会处理云厂商侧的安全组 / 防火墙，请确认 SSH 端口已放行。
+- **`REMOVE_FIREWALL=1` 会降低主机安全性**，公网机器请自行配合云厂商安全组或其它防护。
+- **`rp_filter=0`** 适合中转 / 多网卡 / 非对称路由场景。纯服务器可以在 `/etc/sysctl.d/99-zz-vps-init.conf` 中改为 `1`，但注意重新运行脚本会覆盖该文件。
+- **容器型 VPS（LXC / OpenVZ）**：很多内核参数、内核模块、swap 无法在容器内修改，脚本会给出警告，但不保证全部生效。
+- **已运行的服务**需要重启后才会应用新的文件句柄限制；SSH 需要重新登录。
+- 脚本不会自动重启服务器。
+- 请先在测试机上运行，再用于生产环境。
 
-脚本需要修改：
+## 常见问题
 
-```text
-/etc/sysctl.conf
-/etc/security/limits.conf
-/etc/rc.local
-/etc/systemd/
-```
+**Q：为什么很多脚本在"安装常用命令"时卡住？**
+通常是 `apt` 弹出了交互界面（`iperf3` 的 debconf 对话框，或 Ubuntu 22.04+ 的 `needrestart` 服务重启提示），但脚本把输出重定向到了 `/dev/null`，看起来就像卡死。本脚本设置了 `DEBIAN_FRONTEND=noninteractive`、`NEEDRESTART_MODE=a`，并把输出写入日志。
 
-以及系统服务，因此需要 Root 权限。
+**Q：运行后 BBR 没有生效？**
+在脚本结尾的验证汇总里查看"拥塞控制"一项。常见原因：容器型虚拟化不允许修改；或其它 sysctl 配置覆盖了本脚本（查看 `sysctl -a | grep congestion`，以及 `/etc/sysctl.conf` 和 `/etc/sysctl.d/`）。
 
-### 2. 防火墙会被卸载
+**Q：国内机器如何改 NTP 服务器？**
+脚本使用发行版默认的时间同步服务。如需指定，可在 `/etc/systemd/timesyncd.conf.d/` 下添加 `NTP=` 配置，或修改 `/etc/chrony/chrony.conf`。
 
-脚本会停止并卸载：
+**Q：需要 speedtest / tcping 怎么办？**
+脚本不下载第三方二进制。可使用 `apt install speedtest-cli`，或按 Ookla 官方文档添加其 apt 源。`tcptraceroute` 已默认安装。
 
-```text
-firewalld
-ufw
-```
+## 许可证
 
-运行脚本之前，请确认云厂商的安全组已经放行 SSH 端口。
-
-### 3. 腾讯云 Agent
-
-如果检测到：
-
-```text
-/usr/local/qcloud
-```
-
-脚本会尝试卸载腾讯云相关 Agent。
-
-腾讯云 VPS 请谨慎运行。
-
-### 4. sysctl.d
-
-脚本会清理：
-
-```text
-/etc/sysctl.d/*.conf
-```
-
-执行前会自动备份到：
-
-```text
-/root/sysctl-backup-时间/
-```
-
-### 5. BBR
-
-脚本不会仅通过：
-
-```bash
-lsmod | grep bbr
-```
-
-判断 BBR。
-
-推荐使用：
-
-```bash
-sysctl net.ipv4.tcp_congestion_control
-```
-
-如果显示：
-
-```text
-net.ipv4.tcp_congestion_control = bbr
-```
-
-说明当前 TCP 拥塞控制算法已经使用 BBR。
-
-### 6. 不会自动重启
-
-脚本执行完成后不会自动重启服务器。
-
-如果修改了 Kernel 或其他需要重启才能生效的系统组件，请根据实际情况手动重启。
-
----
-
-## 支持系统
-
-主要支持：
-
-* Debian 11+
-* Debian 12+
-* Debian 13+
-* Ubuntu 20.04+
-* Ubuntu 22.04+
-* Ubuntu 24.04+
-* Ubuntu 26.04+
-* CentOS 7+
-* Rocky Linux
-* AlmaLinux
-
-建议优先使用较新的 Debian / Ubuntu LTS。
-
----
-
-## 脚本地址
-
-GitHub：
-
-https://github.com/newxqkjfenxiang/docker-install
-
-初始化脚本：
-
-https://raw.githubusercontent.com/newxqkjfenxiang/docker-install/main/inits.sh
-
----
-
-## License
-
-MIT
-
-```
-```
+MIT License。使用前请自行评估风险，**作者不对因运行本脚本造成的任何损失负责**。
