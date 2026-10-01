@@ -1,320 +1,662 @@
 #!/bin/bash
 # =====================================================================
-# vps-init  —  VPS 初始化 / 网络优化脚本
-# 支持: Debian 11/12, Ubuntu 22.04/24.04/26.04
+# vps-init — Conservative VPS initialization / network optimization
+# Supports: Debian 11/12, Ubuntu 22.04/24.04/26.04
 #
-# 特点:
-#   * 全程非交互，不会卡在 debconf / needrestart
-#   * 所有输出写入日志，终端只显示进度
-#   * 修改前自动备份；使用 drop-in 文件，不覆盖系统配置
-#   * 不下载任何第三方二进制/脚本，只使用发行版官方源
-#   * 可重复执行（幂等），并自动清理旧版脚本残留
-#   * 结束时输出验证汇总
-#
-# 用法:   bash init.sh            (默认: 安全优化)
-#         bash init.sh --help     (查看全部选项)
+# Design:
+#   - Safe defaults: no IPv4 forwarding, no route_localnet, no firewall removal
+#   - BBR + FQ when the running kernel supports BBR
+#   - Conservative sysctl tuning; avoids aggressive TCP retry/TIME-WAIT tweaks
+#   - Optional RPS/RFS, swap, limits, firewall/cloud-agent cleanup
+#   - No third-party binaries or scripts are downloaded
+#   - Changes are written to drop-in files; original files are backed up
+#   - Idempotent and leaves a detailed log
 # =====================================================================
 
 set -u
+set -o pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
-# ---------------------------- 可配置项 -------------------------------
+# ---------------------------- options ---------------------------------
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
-ENABLE_FORWARD="${ENABLE_FORWARD:-1}"
+ENABLE_FORWARD="${ENABLE_FORWARD:-0}"
+DISABLE_RP_FILTER="${DISABLE_RP_FILTER:-0}"
 ENABLE_RPS="${ENABLE_RPS:-1}"
 MAKE_SWAP="${MAKE_SWAP:-1}"
+SET_LIMITS="${SET_LIMITS:-1}"
 STOP_IRQBALANCE="${STOP_IRQBALANCE:-0}"
 REMOVE_FIREWALL="${REMOVE_FIREWALL:-0}"
 REMOVE_CLOUD_AGENTS="${REMOVE_CLOUD_AGENTS:-0}"
 INSTALL_PACKAGES="${INSTALL_PACKAGES:-1}"
+JOURNAL_MAX_USE="${JOURNAL_MAX_USE:-300M}"
+
+LOG="/var/log/vps-init.log"
+BACKUP_DIR="/root/vps-init-backup-$(date +%Y%m%d-%H%M%S)"
+SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init.conf"
+LIMITS_FILE="/etc/security/limits.d/99-vps-init.conf"
+SYSTEMD_LIMITS_FILE="/etc/systemd/system.conf.d/99-vps-init.conf"
+JOURNAL_FILE="/etc/systemd/journald.conf.d/99-vps-init.conf"
+RPS_SCRIPT="/usr/local/sbin/vps-init-rps.sh"
+RPS_UNIT="/etc/systemd/system/vps-init-rps.service"
+PROFILE_FILE="/etc/profile.d/99-vps-init.sh"
+
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+blue='\033[0;34m'
+plain='\033[0m'
+
+info() {
+    echo -e "${green}[OK]${plain}   $*"
+}
+
+warn() {
+    echo -e "${yellow}[WARN]${plain} $*"
+}
+
+err() {
+    echo -e "${red}[ERR]${plain}  $*"
+}
+
+step() {
+    echo -e "\n${blue}==>${plain} $*"
+}
 
 usage() {
-    cat <<EOF
+    cat <<EOF_USAGE
 vps-init ${VERSION}
 
-用法: [ENV=VALUE ...] bash init.sh
+用法:
+  sudo bash init.sh
+  sudo ENV=VALUE bash init.sh
+  bash init.sh --help
 
-环境变量 (默认值):
-  TIMEZONE=Asia/Shanghai    时区
-  ENABLE_FORWARD=1          开启 IPv4 转发 (中转机需要; 非中转机设 0)
-  ENABLE_RPS=1              开启 RPS/RFS (多核网卡软中断分流)
-  MAKE_SWAP=1               没有 swap 时创建 (大小 = min(内存, 512M))
-  STOP_IRQBALANCE=0         停止 irqbalance
-  REMOVE_FIREWALL=0         停用并卸载 ufw / firewalld, 关闭 SELinux
-  REMOVE_CLOUD_AGENTS=0     卸载腾讯云等云厂商监控组件, 停用 waagent 等
-  INSTALL_PACKAGES=1        安装常用工具包
+环境变量:
+  TIMEZONE=Asia/Shanghai    设置系统时区
+  ENABLE_FORWARD=0          IPv4 转发，普通 VPS 默认关闭；中转/NAT/VPN 设为 1
+  DISABLE_RP_FILTER=0       rp_filter 默认严格模式；非对称路由/中转可设为 1
+  ENABLE_RPS=1              RPS/RFS；多核 VPS 默认开启，脚本会按队列情况判断
+  MAKE_SWAP=1               无 swap 时创建 128~512 MiB swapfile
+  SET_LIMITS=1              设置 nofile=1000000（PAM + systemd 默认值）
+  STOP_IRQBALANCE=0         是否停用 irqbalance
+  REMOVE_FIREWALL=0         是否卸载 ufw / firewalld；默认绝不处理
+  REMOVE_CLOUD_AGENTS=0     是否尝试卸载已存在的腾讯云/常见云代理；默认绝不处理
+  INSTALL_PACKAGES=1        是否安装常用诊断工具
+  JOURNAL_MAX_USE=300M      journald 最大磁盘占用
 
-示例:
-  bash init.sh
-  ENABLE_FORWARD=0 bash init.sh
-  REMOVE_FIREWALL=1 REMOVE_CLOUD_AGENTS=1 bash init.sh
-EOF
+推荐:
+
+  普通 VPS:
+    bash init.sh
+
+  中转 / NAT / VPN:
+    ENABLE_FORWARD=1 bash init.sh
+
+  非对称路由 / 多网卡中转:
+    ENABLE_FORWARD=1 DISABLE_RP_FILTER=1 bash init.sh
+
+  不想创建 Swap:
+    MAKE_SWAP=0 bash init.sh
+
+  不想启用 RPS/RFS:
+    ENABLE_RPS=0 bash init.sh
+
+注意:
+  - 不会自动重启服务器。
+  - 不会修改云厂商安全组。
+  - 默认不卸载防火墙、不卸载云厂商组件、不关闭 tuned/smartd。
+  - 不更换内核，不下载第三方二进制。
+EOF_USAGE
 }
 
 case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
 esac
 
-LOG=/var/log/vps-init.log
-BACKUP_DIR="/root/init-backup-$(date +%Y%m%d-%H%M%S)"
-SYSCTL_FILE=/etc/sysctl.d/99-zz-vps-init.conf
+[[ $EUID -eq 0 ]] || {
+    err "必须使用 root 用户运行。"
+    exit 1
+}
 
-red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; plain='\033[0m'
-info() { echo -e "${green}[OK]${plain}   $*"; }
-warn() { echo -e "${yellow}[WARN]${plain} $*"; }
-err()  { echo -e "${red}[ERR]${plain}  $*"; }
-step() { echo -e "\n==> $*"; }
+mkdir -p "$(dirname "$LOG")" "$BACKUP_DIR"
+:"$LOG"
 
-# 执行命令, 输出写入日志
-run() { "$@" >>"$LOG" 2>&1; }
+# 防止多个实例同时修改 sysctl / systemd 配置
+exec 9>/run/lock/vps-init.lock
+
+if ! flock -n 9 2>/dev/null; then
+    err "检测到另一个 vps-init 正在运行。"
+    exit 1
+fi
+
+log_cmd() {
+    printf '\n[%s] +' "$(date '+%F %T')" >>"$LOG"
+    printf ' %q' "$@" >>"$LOG"
+    printf '\n' >>"$LOG"
+}
+
+run() {
+    log_cmd "$@"
+    "$@" >>"$LOG" 2>&1
+}
+
+run_shell() {
+    log_cmd /bin/bash -c "$1"
+    /bin/bash -c "$1" >>"$LOG" 2>&1
+}
+
+backup() {
+    local f
+
+    for f in "$@"; do
+        [[ -e "$f" ]] || continue
+
+        mkdir -p "$BACKUP_DIR$(dirname "$f")"
+        cp -a "$f" "$BACKUP_DIR$f" 2>>"$LOG" || true
+    done
+}
+
+unit_exists() {
+    systemctl list-unit-files --no-legend 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -qx "$1.service"
+}
+
+valid_bool() {
+    case "$2" in
+        0|1)
+            ;;
+        *)
+            err "$1 必须是 0 或 1，当前: $2"
+            exit 1
+            ;;
+    esac
+}
+
+for pair in \
+    "ENABLE_FORWARD:$ENABLE_FORWARD" \
+    "DISABLE_RP_FILTER:$DISABLE_RP_FILTER" \
+    "ENABLE_RPS:$ENABLE_RPS" \
+    "MAKE_SWAP:$MAKE_SWAP" \
+    "SET_LIMITS:$SET_LIMITS" \
+    "STOP_IRQBALANCE:$STOP_IRQBALANCE" \
+    "REMOVE_FIREWALL:$REMOVE_FIREWALL" \
+    "REMOVE_CLOUD_AGENTS:$REMOVE_CLOUD_AGENTS" \
+    "INSTALL_PACKAGES:$INSTALL_PACKAGES"; do
+
+    valid_bool "${pair%%:*}" "${pair#*:}"
+done
 
 # ---------------------------------------------------------------------
-# 前置检查
+# 0. System detection
 # ---------------------------------------------------------------------
-[[ $EUID -ne 0 ]] && err "必须使用 root 用户运行此脚本！" && exit 1
 
-mkdir -p "$BACKUP_DIR"
-: >"$LOG"
+[[ -f /etc/os-release ]] || {
+    err "无法读取 /etc/os-release。"
+    exit 1
+}
 
-echo "============================================================"
-echo " vps-init ${VERSION}"
-echo "============================================================"
-echo "日志文件: $LOG"
-echo "备份目录: $BACKUP_DIR"
-
-[[ -f /etc/os-release ]] || { err "无法识别系统"; exit 1; }
 . /etc/os-release
+
 case "${ID:-}" in
-    debian|ubuntu) ;;
-    *) err "仅支持 Debian / Ubuntu，当前: ${ID:-unknown}"; exit 1 ;;
+    debian)
+        case "${VERSION_ID:-}" in
+            11|12)
+                ;;
+            *)
+                err "仅支持 Debian 11/12，当前: ${PRETTY_NAME:-unknown}"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    ubuntu)
+        case "${VERSION_ID:-}" in
+            22.04|24.04|26.04)
+                ;;
+            *)
+                err "仅支持 Ubuntu 22.04/24.04/26.04，当前: ${PRETTY_NAME:-unknown}"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    *)
+        err "仅支持 Debian / Ubuntu，当前: ${ID:-unknown}"
+        exit 1
+        ;;
 esac
-command -v systemctl >/dev/null 2>&1 || { err "需要 systemd"; exit 1; }
+
+command -v systemctl >/dev/null 2>&1 || {
+    err "需要 systemd。"
+    exit 1
+}
+
+command -v sysctl >/dev/null 2>&1 || {
+    err "需要 procps/sysctl。"
+    exit 1
+}
 
 if command -v systemd-detect-virt >/dev/null 2>&1; then
     VIRT="$(systemd-detect-virt 2>/dev/null || true)"
 else
     VIRT="unknown"
 fi
-info "系统: ${PRETTY_NAME:-$ID} | 内核: $(uname -r) | 架构: $(uname -m) | 虚拟化: ${VIRT:-none}"
+
+VIRT="${VIRT:-none}"
+
+KERNEL="$(uname -r)"
+ARCH="$(uname -m)"
+
+info "系统: ${PRETTY_NAME:-$ID} | 内核: $KERNEL | 架构: $ARCH | 虚拟化: $VIRT"
+
 case "$VIRT" in
-    lxc|openvz|docker|podman)
-        warn "检测到容器环境 ($VIRT)，sysctl / 内核模块 / swap 等部分设置可能无法生效" ;;
+    lxc|lxc-libvirt|openvz|docker|podman|systemd-nspawn|pouch)
+        warn "检测到容器/共享内核环境 ($VIRT)，部分 sysctl、内核模块、Swap、RPS 可能由宿主机控制。"
+        ;;
 esac
 
-# 非交互环境: 防止 debconf / needrestart 弹窗卡住
+# 非交互环境
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
 export APT_LISTCHANGES_FRONTEND=none
 
-APT_OPTS=(-y -q
+APT_OPTS=(
+    -y
     -o Dpkg::Options::=--force-confdef
     -o Dpkg::Options::=--force-confold
-    -o DPkg::Lock::Timeout=300)
-
-backup() {
-    local f
-    for f in "$@"; do
-        [[ -e "$f" ]] && cp -a --parents "$f" "$BACKUP_DIR" 2>/dev/null
-    done
-    return 0
-}
-
-unit_exists() { systemctl list-unit-files 2>/dev/null | grep -q "^$1\.service"; }
+    -o DPkg::Lock::Timeout=300
+)
 
 # ---------------------------------------------------------------------
-# 1. 软件包
+# 1. Packages
 # ---------------------------------------------------------------------
+
 if [[ "$INSTALL_PACKAGES" == "1" ]]; then
-    step "更新软件源并安装常用工具 (可能需要几分钟)"
-    run apt-get update -q -o DPkg::Lock::Timeout=300 || warn "apt-get update 失败，见日志"
 
-    PKGS=(wget curl ca-certificates net-tools mtr-tiny traceroute tcptraceroute bc
-          nload vnstat lsof htop iftop telnet git dnsutils vim iperf3 ethtool
-          iproute2 unzip jq)
+    step "安装常用系统/网络诊断工具"
 
-    # iperf3 安装时会弹 debconf 问题, 预先回答 "不作为守护进程启动"
-    echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections >>"$LOG" 2>&1
+    if run apt-get update -q -o DPkg::Lock::Timeout=300; then
 
-    if run apt-get install "${APT_OPTS[@]}" "${PKGS[@]}"; then
-        info "常用工具已安装"
+        PKGS=(
+            ca-certificates
+            curl
+            wget
+
+            iproute2
+            iputils-ping
+            net-tools
+            ethtool
+
+            mtr-tiny
+            traceroute
+            tcptraceroute
+
+            nload
+            vnstat
+            htop
+            iftop
+            lsof
+
+            dnsutils
+            iperf3
+
+            git
+            vim
+            jq
+            unzip
+        )
+
+        AVAILABLE=()
+
+        for pkg in "${PKGS[@]}"; do
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+                AVAILABLE+=("$pkg")
+            else
+                warn "软件包不可用，跳过: $pkg"
+            fi
+        done
+
+        if command -v debconf-set-selections >/dev/null 2>&1 \
+           && printf '%s\n' "${AVAILABLE[@]}" | grep -qx iperf3; then
+
+            printf '%s\n' \
+                'iperf3 iperf3/start_daemon boolean false' \
+                | debconf-set-selections >>"$LOG" 2>&1 || true
+        fi
+
+        if ((${#AVAILABLE[@]})); then
+            if run apt-get install "${APT_OPTS[@]}" "${AVAILABLE[@]}"; then
+                info "常用工具安装完成。"
+            else
+                warn "部分软件包安装失败，请查看: $LOG"
+            fi
+        fi
+
     else
-        warn "部分软件包安装失败，日志末尾如下:"
-        tail -n 8 "$LOG" | sed 's/^/        /'
+        warn "apt-get update 失败；跳过软件包安装，请查看: $LOG"
     fi
+
+else
+    info "跳过软件包安装 (INSTALL_PACKAGES=0)"
 fi
 
 # ---------------------------------------------------------------------
-# 2. 防火墙 / SELinux (默认不动)
+# 2. Firewall
 # ---------------------------------------------------------------------
+
 step "防火墙"
+
 if [[ "$REMOVE_FIREWALL" == "1" ]]; then
+
+    warn "REMOVE_FIREWALL=1：即将卸载 ufw / firewalld。请确认 SSH 已由云安全组或其它防火墙保护。"
+
     for svc in ufw firewalld; do
-        if unit_exists "$svc"; then
-            run systemctl disable --now "$svc"
-            run apt-get purge "${APT_OPTS[@]}" "$svc"
-            info "已停用并卸载 $svc"
+
+        if unit_exists "$svc" \
+           || dpkg-query -W -f='${Status}\n' "$svc" 2>/dev/null \
+              | grep -q 'install ok installed'; then
+
+            backup \
+                "/etc/ufw/ufw.conf" \
+                "/etc/firewalld/firewalld.conf"
+
+            run systemctl disable --now "$svc" || true
+            run apt-get purge "${APT_OPTS[@]}" "$svc" || true
+
+            info "已处理 $svc"
         fi
     done
-    if command -v setenforce >/dev/null 2>&1; then
-        run setenforce 0
-        [[ -f /etc/selinux/config ]] && sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
-        info "已关闭 SELinux"
-    fi
+
 else
-    info "跳过 (如需停用: REMOVE_FIREWALL=1)"
+    info "保留现有防火墙配置。"
 fi
 
 # ---------------------------------------------------------------------
-# 3. 云厂商组件 / 无用服务
+# 3. Cloud agents
 # ---------------------------------------------------------------------
-step "系统服务"
+
+step "云厂商组件"
+
 if [[ "$REMOVE_CLOUD_AGENTS" == "1" ]]; then
-    for svc in waagent walinuxagent hypervkvpd; do
+
+    warn "REMOVE_CLOUD_AGENTS=1：仅处理脚本明确识别到的组件，不代表所有云厂商 agent。"
+
+    for svc in walinuxagent waagent hypervkvpd; do
+
         if unit_exists "$svc"; then
-            run systemctl disable --now "$svc"
-            info "已停止 $svc"
+            run systemctl disable --now "$svc" || true
+            info "已停止 $svc.service"
         fi
+
     done
 
     if [[ -d /usr/local/qcloud ]]; then
-        for s in /usr/local/qcloud/YunJing/uninst.sh \
-                 /usr/local/qcloud/stargate/admin/uninstall.sh \
-                 /usr/local/qcloud/monitor/barad/admin/uninstall.sh \
-                 /usr/local/sa/agent/uninstall.sh; do
-            [[ -x "$s" ]] && run "$s"
+
+        for s in \
+            /usr/local/qcloud/YunJing/uninst.sh \
+            /usr/local/qcloud/stargate/admin/uninstall.sh \
+            /usr/local/qcloud/monitor/barad/admin/uninstall.sh \
+            /usr/local/sa/agent/uninstall.sh; do
+
+            if [[ -x "$s" ]]; then
+                backup "$s"
+                run "$s" || warn "云厂商卸载程序返回非 0: $s"
+            fi
+
         done
+
         rm -rf /usr/local/qcloud
-        [[ -f /etc/rc.local ]] && sed -i '/qcloud/d' /etc/rc.local
-        info "已卸载腾讯云组件"
+
+        if [[ -f /etc/rc.local ]]; then
+            backup /etc/rc.local
+            sed -i '/qcloud/d' /etc/rc.local
+        fi
+
+        info "已处理 /usr/local/qcloud。"
+
+    else
+        info "未发现 /usr/local/qcloud。"
     fi
+
 else
-    info "跳过云厂商组件 (如需卸载: REMOVE_CLOUD_AGENTS=1)"
+    info "不处理云厂商组件。"
 fi
 
-for svc in tuned smartd; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-        run systemctl disable --now "$svc"
-        info "已停止 $svc"
+# 不再默认关闭 tuned / smartd
+if [[ "$STOP_IRQBALANCE" == "1" ]]; then
+
+    if unit_exists irqbalance; then
+        run systemctl disable --now irqbalance || true
+        info "已停止 irqbalance。"
+    else
+        info "未发现 irqbalance。"
     fi
-done
 
-if [[ "$STOP_IRQBALANCE" == "1" ]] && unit_exists irqbalance; then
-    run systemctl disable --now irqbalance
-    info "已停止 irqbalance"
+else
+    info "保留 irqbalance（如需停用: STOP_IRQBALANCE=1）。"
 fi
 
 # ---------------------------------------------------------------------
-# 4. 文件句柄 / ulimit
+# 4. File descriptor limits
 # ---------------------------------------------------------------------
-step "文件句柄与进程数限制"
-backup /etc/security/limits.conf /etc/systemd/system.conf /etc/profile
-mkdir -p /etc/security/limits.d /etc/systemd/system.conf.d
 
-cat >/etc/security/limits.d/99-vps-init.conf <<'EOF'
+step "文件句柄限制"
+
+if [[ "$SET_LIMITS" == "1" ]]; then
+
+    backup \
+        /etc/security/limits.conf \
+        /etc/systemd/system.conf
+
+    mkdir -p \
+        /etc/security/limits.d \
+        /etc/systemd/system.conf.d
+
+    cat >"$LIMITS_FILE" <<'EOF_LIMITS'
+# Generated by vps-init. Safe to remove to roll back.
+
 *     soft   nofile    1000000
 *     hard   nofile    1000000
 root  soft   nofile    1000000
 root  hard   nofile    1000000
-*     soft   nproc     1000000
-*     hard   nproc     1000000
-root  soft   nproc     1000000
-root  hard   nproc     1000000
-*     soft   memlock   unlimited
-*     hard   memlock   unlimited
-root  soft   memlock   unlimited
-root  hard   memlock   unlimited
-EOF
+EOF_LIMITS
 
-# systemd 服务 (不经过 PAM) 的默认限制
-cat >/etc/systemd/system.conf.d/99-vps-init.conf <<'EOF'
+    cat >"$SYSTEMD_LIMITS_FILE" <<'EOF_SYSTEMD_LIMITS'
+# Generated by vps-init. Safe to remove to roll back.
+
 [Manager]
 DefaultLimitNOFILE=1000000
-DefaultLimitNPROC=1000000
-EOF
+EOF_SYSTEMD_LIMITS
 
-for f in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
-    if [[ -f "$f" ]] && ! grep -q 'pam_limits.so' "$f"; then
-        echo "session required pam_limits.so" >>"$f"
+    PAM_LIMITS_MODULE=""
+
+    for candidate in \
+        /usr/lib/*/security/pam_limits.so \
+        /lib/*/security/pam_limits.so \
+        /usr/lib/security/pam_limits.so \
+        /lib/security/pam_limits.so; do
+
+        if [[ -f "$candidate" ]]; then
+            PAM_LIMITS_MODULE="$candidate"
+            break
+        fi
+
+    done
+
+    if [[ -n "$PAM_LIMITS_MODULE" ]]; then
+
+        for f in \
+            /etc/pam.d/common-session \
+            /etc/pam.d/common-session-noninteractive; do
+
+            if [[ -f "$f" ]] \
+               && ! grep -Eq \
+                    '^[[:space:]]*session[[:space:]]+.*pam_limits\.so' \
+                    "$f"; then
+
+                backup "$f"
+
+                printf '\nsession required pam_limits.so\n' >>"$f"
+
+                info "已启用 pam_limits: $f"
+            fi
+        done
     fi
-done
-run systemctl daemon-reload
-info "limits 已写入 (新登录会话 / 重启后的服务生效)"
+
+    run systemctl daemon-reload
+
+    info "nofile=1000000 已写入；新登录会话/新启动的 systemd 服务生效。"
+
+else
+    info "跳过 limits (SET_LIMITS=0)。"
+fi
 
 # ---------------------------------------------------------------------
 # 5. Swap
 # ---------------------------------------------------------------------
-mk_swap() {
-    local swap_total mem_mb
-    swap_total=$(free -m | awk '/^Swap:/{print $2}')
-    if [[ "${swap_total:-0}" -gt 0 ]]; then
-        info "已存在 swap (${swap_total}M)，跳过"
-        return
-    fi
-    mem_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-    [[ $mem_mb -gt 512 ]] && mem_mb=512
-    [[ $mem_mb -lt 128 ]] && mem_mb=128
 
-    if [[ -e /swapfile ]]; then
-        warn "/swapfile 已存在但未启用，跳过"
-        return
+step "Swap"
+
+create_swap() {
+
+    local swap_total
+    local mem_mb
+    local swap_path=/swapfile
+
+    swap_total="$(
+        awk '/^SwapTotal:/{printf "%d", $2/1024}' \
+        /proc/meminfo 2>/dev/null || echo 0
+    )"
+
+    if [[ "${swap_total:-0}" -gt 0 ]]; then
+        info "已有 Swap: ${swap_total} MiB，跳过。"
+        return 0
     fi
-    if ! fallocate -l "${mem_mb}M" /swapfile 2>>"$LOG"; then
-        dd if=/dev/zero of=/swapfile bs=1M count="$mem_mb" status=none 2>>"$LOG"
+
+    if [[ -e "$swap_path" ]]; then
+        warn "$swap_path 已存在但当前未启用，脚本不会接管它。"
+        return 0
     fi
-    chmod 600 /swapfile
-    if run mkswap /swapfile && run swapon /swapfile; then
-        grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap defaults 0 0' >>/etc/fstab
-        info "已创建 ${mem_mb}M swap"
+
+    mem_mb="$(
+        awk '/^MemTotal:/{printf "%d", $2/1024}' \
+        /proc/meminfo 2>/dev/null || echo 512
+    )"
+
+    [[ "$mem_mb" -gt 512 ]] && mem_mb=512
+    [[ "$mem_mb" -lt 128 ]] && mem_mb=128
+
+    if command -v fallocate >/dev/null 2>&1 \
+       && fallocate -l "${mem_mb}M" "$swap_path" 2>>"$LOG"; then
+        :
+
+    elif command -v dd >/dev/null 2>&1; then
+
+        if ! dd \
+            if=/dev/zero \
+            of="$swap_path" \
+            bs=1M \
+            count="$mem_mb" \
+            status=none >>"$LOG" 2>&1; then
+
+            rm -f "$swap_path"
+            warn "Swap 文件创建失败。"
+            return 1
+        fi
+
     else
-        warn "swap 创建失败 (部分文件系统/容器不支持)，见日志"
-        rm -f /swapfile
+        warn "系统没有 fallocate/dd，无法创建 Swap。"
+        return 1
+    fi
+
+    chmod 600 "$swap_path"
+
+    if run mkswap "$swap_path" \
+       && run swapon "$swap_path"; then
+
+        if ! grep -Eq '^/swapfile[[:space:]]' /etc/fstab; then
+            backup /etc/fstab
+            echo '/swapfile none swap defaults 0 0' >>/etc/fstab
+        fi
+
+        info "已创建并启用 ${mem_mb} MiB Swap。"
+
+    else
+        rm -f "$swap_path"
+        warn "Swap 启用失败；常见原因是容器环境或文件系统限制。"
+        return 1
     fi
 }
-step "Swap"
-if [[ "$MAKE_SWAP" == "1" ]]; then mk_swap; else info "跳过 (MAKE_SWAP=0)"; fi
+
+if [[ "$MAKE_SWAP" == "1" ]]; then
+    create_swap || true
+else
+    info "跳过 Swap (MAKE_SWAP=0)。"
+fi
 
 # ---------------------------------------------------------------------
-# 6. 内核网络参数 + BBR
+# 6. Sysctl + BBR/FQ
 # ---------------------------------------------------------------------
-step "内核网络参数 / BBR"
-backup /etc/sysctl.conf /etc/sysctl.d
-mkdir -p /etc/sysctl.d
 
-# 旧版本脚本(本项目 1.x)生成的文件
-rm -f /etc/sysctl.d/99-custom.conf
+step "内核网络参数 / BBR / FQ"
 
-run modprobe tcp_bbr
-echo "tcp_bbr" >/etc/modules-load.d/bbr.conf
+mkdir -p \
+    /etc/sysctl.d \
+    /etc/modules-load.d
 
-HAS_BBR=0
-grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && HAS_BBR=1
+backup \
+    "$SYSCTL_FILE" \
+    /etc/sysctl.conf
 
-cat >"$SYSCTL_FILE" <<'EOF'
-# Generated by vps-init. Do not edit by hand; re-run the script instead.
+# 删除早期版本已知配置
+rm -f \
+    /etc/sysctl.d/99-custom.conf \
+    /etc/sysctl.d/99-vps-init.conf
 
-# ---- 内存 / IO ----
-vm.swappiness=10
-vm.dirty_background_bytes=26214400
-vm.dirty_bytes=52428800
+BBR_AVAILABLE=0
 
-# ---- 文件 ----
-fs.file-max=1000000
-fs.inotify.max_user_instances=131072
+if command -v modprobe >/dev/null 2>&1; then
+    run modprobe tcp_bbr || true
+fi
 
-# ---- RFS: 同时活跃连接数的预期最大值 ----
-net.core.rps_sock_flow_entries=65536
+if grep -qw bbr \
+    /proc/sys/net/ipv4/tcp_available_congestion_control \
+    2>/dev/null; then
 
-# ---- IPv6: 开启转发会导致 DHCP/SLAAC 拿不到地址, 因此保持 0 ----
+    BBR_AVAILABLE=1
+    echo 'tcp_bbr' > /etc/modules-load.d/bbr.conf
+fi
+
+# ---------------------------------------------------------------------
+# IMPORTANT:
+#
+# Linux documents ip_forward as a special variable:
+# changing it resets IPv4 configuration parameters to host/router defaults.
+#
+# Therefore ip_forward is intentionally written BEFORE the other
+# IPv4 conf.* parameters below.
+# ---------------------------------------------------------------------
+
+cat >"$SYSCTL_FILE" <<EOF_SYSCTL
+# Generated by vps-init ${VERSION}
+# Conservative defaults; remove this file to roll back.
+
+# ---- IPv4 forwarding ----
+net.ipv4.ip_forward=$([[ "$ENABLE_FORWARD" == "1" ]] && echo 1 || echo 0)
+
+# ---- IPv6 forwarding ----
 net.ipv6.conf.all.forwarding=0
 net.ipv6.conf.default.forwarding=0
 net.ipv6.conf.all.disable_ipv6=0
 net.ipv6.conf.default.disable_ipv6=0
-net.ipv6.conf.all.accept_ra=2
-net.ipv6.conf.default.accept_ra=2
 
-# ---- ICMP 重定向 ----
+# ---- Redirects / routing safety ----
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
 net.ipv4.conf.all.secure_redirects=0
@@ -324,125 +666,212 @@ net.ipv4.conf.default.send_redirects=0
 net.ipv6.conf.all.accept_redirects=0
 net.ipv6.conf.default.accept_redirects=0
 
-# ---- 反向路径过滤 (中转/多网卡场景关闭; 纯服务器可改为 1) ----
-net.ipv4.conf.all.rp_filter=0
-net.ipv4.conf.default.rp_filter=0
+# Keep strict reverse-path filtering by default.
+# For asymmetric routing / multi-homing / relay designs:
+# DISABLE_RP_FILTER=1
+net.ipv4.conf.all.rp_filter=$(
+    [[ "${DISABLE_RP_FILTER:-0}" == "1" ]] && echo 0 || echo 1
+)
+net.ipv4.conf.default.rp_filter=$(
+    [[ "${DISABLE_RP_FILTER:-0}" == "1" ]] && echo 0 || echo 1
+)
 
-# ---- TCP 连接管理 ----
+# ---- TCP: conservative changes only ----
 net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_retries2=8
-net.ipv4.tcp_orphan_retries=2
-net.ipv4.tcp_syn_retries=3
-net.ipv4.tcp_synack_retries=3
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_max_tw_buckets=262144
-net.ipv4.tcp_max_syn_backlog=262144
-net.core.netdev_max_backlog=262144
-net.core.somaxconn=65535
-net.ipv4.tcp_notsent_lowat=16384
-net.ipv4.tcp_keepalive_time=300
-net.ipv4.tcp_keepalive_probes=3
-net.ipv4.tcp_keepalive_intvl=30
-
-# ---- TCP 性能 ----
 net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_no_metrics_save=1
 net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_sack=1
+net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_sack=1
 net.ipv4.tcp_moderate_rcvbuf=1
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.core.rmem_default=262144
-net.core.wmem_default=262144
-net.ipv4.tcp_rmem=4096 131072 67108864
-net.ipv4.tcp_wmem=4096 16384 67108864
-net.ipv4.udp_rmem_min=8192
-net.ipv4.udp_wmem_min=8192
 
-# ---- 端口 / 其它 ----
+# Reasonable socket/backlog ceilings for busy VPS workloads.
+# These are ceilings, not pre-allocated memory.
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=16384
+net.ipv4.tcp_max_syn_backlog=16384
+
+# Keepalive is opt-in at the socket/application level.
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+
+# ---- TCP buffers ----
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 131072 33554432
+net.ipv4.tcp_wmem=4096 16384 33554432
+
+# ---- Ports / VM ----
 net.ipv4.ip_local_port_range=10000 65535
-net.ipv4.ping_group_range=0 2147483647
-net.core.default_qdisc=fq
-EOF
+vm.swappiness=10
 
-if [[ "$HAS_BBR" == "1" ]]; then
-    echo "net.ipv4.tcp_congestion_control=bbr" >>"$SYSCTL_FILE"
+# ---- Queue discipline ----
+net.core.default_qdisc=fq
+EOF_SYSCTL
+
+if [[ "$BBR_AVAILABLE" == "1" ]]; then
+    echo 'net.ipv4.tcp_congestion_control=bbr' >>"$SYSCTL_FILE"
 else
-    warn "当前内核不支持 BBR (容器/OpenVZ?)，已跳过 BBR 设置"
+    warn "当前内核没有可用的 BBR；不会更换内核。"
+fi
+
+# 只应用自己的 drop-in。
+# 不使用 sysctl --system，避免把 /etc/sysctl.conf 一起重新处理。
+if command -v systemd-sysctl >/dev/null 2>&1; then
+
+    if run systemd-sysctl "$SYSCTL_FILE"; then
+        info "sysctl drop-in 已应用。"
+    else
+        warn "systemd-sysctl 返回非 0；容器环境可能拒绝部分参数，请查看日志。"
+    fi
+
+else
+
+    if run sysctl -p "$SYSCTL_FILE"; then
+        info "sysctl drop-in 已应用。"
+    else
+        warn "sysctl 应用部分失败，请查看日志。"
+    fi
 fi
 
 if [[ "$ENABLE_FORWARD" == "1" ]]; then
-    cat >>"$SYSCTL_FILE" <<'EOF'
-
-# ---- IPv4 路由转发 ----
-net.ipv4.conf.all.route_localnet=1
-net.ipv4.ip_forward=1
-net.ipv4.conf.all.forwarding=1
-net.ipv4.conf.default.forwarding=1
-EOF
-fi
-
-# 旧配置残留: /etc/sysctl.conf 总是最后被读取, 会覆盖 sysctl.d 中的同名参数。
-# 将其中与本脚本重复的键注释掉 (已备份)。
-if [[ -f /etc/sysctl.conf ]]; then
-    n=0
-    while IFS= read -r key; do
-        [[ -z "$key" ]] && continue
-        esc=${key//./\\.}
-        if grep -qE "^[[:space:]]*${esc}[[:space:]]*=" /etc/sysctl.conf; then
-            sed -i -E "s|^[[:space:]]*(${esc})[[:space:]]*=|#disabled-by-vps-init# \1=|" /etc/sysctl.conf
-            n=$((n + 1))
-        fi
-    done < <(grep -E '^[a-z]' "$SYSCTL_FILE" | cut -d= -f1 | tr -d ' ')
-    [[ $n -gt 0 ]] && info "已注释 /etc/sysctl.conf 中 $n 个重复参数 (防止覆盖，备份见 $BACKUP_DIR)"
-fi
-
-run sysctl --system
-info "sysctl 已应用"
-
-if [[ "$HAS_BBR" == "1" && "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
-    warn "BBR 写入了配置但当前未生效，请检查其它 sysctl 配置是否覆盖，或查看 $LOG"
+    run sysctl -w net.ipv4.conf.all.forwarding=1 || true
+    run sysctl -w net.ipv4.conf.default.forwarding=1 || true
 fi
 
 # ---------------------------------------------------------------------
-# 7. RPS / RFS (systemd 服务)
+# 7. RPS / RFS
 # ---------------------------------------------------------------------
+
 step "RPS / RFS"
+
+remove_rps_service() {
+
+    run systemctl disable --now vps-init-rps.service || true
+
+    rm -f \
+        "$RPS_UNIT" \
+        "$RPS_SCRIPT"
+
+    run systemctl daemon-reload || true
+}
+
 if [[ "$ENABLE_RPS" == "1" ]]; then
-    ncpu=$(nproc)
-    if [[ "$ncpu" -le 1 ]]; then
-        info "单核 CPU，跳过 RPS"
-    elif [[ "$ncpu" -gt 62 ]]; then
-        warn "CPU 核数过多 (${ncpu})，跳过 RPS"
+
+    CPU_COUNT="$(nproc 2>/dev/null || echo 1)"
+
+    if [[ "$CPU_COUNT" -le 1 ]]; then
+
+        remove_rps_service
+
+        info "单核 VPS 不启用 RPS。"
+
+    elif [[ "$CPU_COUNT" -gt 62 ]]; then
+
+        remove_rps_service
+
+        warn "CPU 核数 $CPU_COUNT > 62，跳过 RPS，避免 Bash 位掩码限制。"
+
     else
-        cat >/usr/local/sbin/vps-init-rps.sh <<'EOF'
+
+        cat >"$RPS_SCRIPT" <<'EOF_RPS'
 #!/bin/bash
-# 将网卡接收队列的软中断分散到全部 CPU
-ncpu=$(nproc)
-mask=$(printf '%x' $(( (1 << ncpu) - 1 )))
+
+# Generated by vps-init.
+# Apply conservative RPS/RFS settings.
+
+set -u
+
+CPU_COUNT="$(nproc 2>/dev/null || echo 1)"
+
+[[ "$CPU_COUNT" -gt 1 && "$CPU_COUNT" -le 62 ]] || exit 0
+
+MASK="$(printf '%x' $(( (1 << CPU_COUNT) - 1 )))"
+
 for dev in /sys/class/net/*; do
-    name=$(basename "$dev")
-    [[ "$name" == "lo" ]] && continue
-    [[ "$name" == veth* || "$name" == docker* || "$name" == br-* ]] && continue
-    queues=("$dev"/queues/rx-*)
-    nq=${#queues[@]}
-    [[ $nq -eq 0 || ! -e "${queues[0]}" ]] && continue
-    flow=$(( 65536 / nq ))
+
+    name="$(basename "$dev")"
+
+    case "$name" in
+        lo)
+            continue
+            ;;
+        docker*)
+            continue
+            ;;
+        br-*)
+            continue
+            ;;
+        veth*)
+            continue
+            ;;
+        cni*)
+            continue
+            ;;
+        flannel*)
+            continue
+            ;;
+        cal*)
+            continue
+            ;;
+    esac
+
+    mapfile -t queues < <(
+        compgen -G "$dev/queues/rx-*"
+    )
+
+    nq="${#queues[@]}"
+
+    (( nq > 0 )) || continue
+
+    # If the NIC already exposes at least as many RX queues as CPUs,
+    # hardware RSS is normally sufficient. Avoid unnecessary software
+    # steering overhead.
+    if (( nq >= CPU_COUNT )); then
+
+        for q in "${queues[@]}"; do
+
+            if [[ -e "$q/rps_cpus" ]]; then
+                printf '0\n' >"$q/rps_cpus" 2>/dev/null || true
+            fi
+
+            if [[ -e "$q/rps_flow_cnt" ]]; then
+                printf '0\n' >"$q/rps_flow_cnt" 2>/dev/null || true
+            fi
+
+        done
+
+        continue
+    fi
+
+    flow=$((65536 / nq))
+
+    (( flow > 0 )) || flow=1
+
     for q in "${queues[@]}"; do
-        echo "$mask" >"$q/rps_cpus" 2>/dev/null
-        echo "$flow" >"$q/rps_flow_cnt" 2>/dev/null
+
+        if [[ -e "$q/rps_cpus" ]]; then
+            printf '%s\n' "$MASK" \
+                >"$q/rps_cpus" 2>/dev/null || true
+        fi
+
+        if [[ -e "$q/rps_flow_cnt" ]]; then
+            printf '%s\n' "$flow" \
+                >"$q/rps_flow_cnt" 2>/dev/null || true
+        fi
+
     done
 done
-exit 0
-EOF
-        chmod +x /usr/local/sbin/vps-init-rps.sh
 
-        cat >/etc/systemd/system/vps-init-rps.service <<'EOF'
+exit 0
+EOF_RPS
+
+        chmod 0755 "$RPS_SCRIPT"
+
+        cat >"$RPS_UNIT" <<'EOF_RPS_UNIT'
 [Unit]
-Description=Enable RPS/RFS on network interfaces (vps-init)
+Description=vps-init RPS/RFS configuration
 After=network-online.target
 Wants=network-online.target
 
@@ -453,151 +882,450 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
-        # 清理 1.x 版本的同类服务
+EOF_RPS_UNIT
+
+        # 清理旧版服务
         if [[ -f /etc/systemd/system/rps.service ]]; then
-            run systemctl disable --now rps.service
-            rm -f /etc/systemd/system/rps.service /usr/local/sbin/rps-setup.sh
+
+            run systemctl disable --now rps.service || true
+
+            rm -f \
+                /etc/systemd/system/rps.service \
+                /usr/local/sbin/rps-setup.sh \
+                /root/rps.sh
         fi
+
         run systemctl daemon-reload
-        run systemctl enable vps-init-rps.service
-        run systemctl restart vps-init-rps.service
-        info "RPS 已开启 (vps-init-rps.service)"
+
+        if run systemctl enable --now vps-init-rps.service \
+           && run systemctl restart vps-init-rps.service; then
+
+            info "RPS/RFS 服务已启用。"
+
+        else
+            warn "RPS/RFS 服务启动失败，请查看: $LOG"
+        fi
     fi
+
 else
-    info "跳过 (ENABLE_RPS=0)"
+
+    remove_rps_service
+
+    info "跳过 RPS/RFS (ENABLE_RPS=0)。"
 fi
 
 # ---------------------------------------------------------------------
-# 8. journald 日志限制
+# 8. journald
 # ---------------------------------------------------------------------
+
 step "systemd-journald"
+
 mkdir -p /etc/systemd/journald.conf.d
-cat >/etc/systemd/journald.conf.d/99-vps-init.conf <<'EOF'
+
+backup "$JOURNAL_FILE"
+
+cat >"$JOURNAL_FILE" <<EOF_JOURNAL
+# Generated by vps-init.
+
 [Journal]
-SystemMaxUse=300M
-EOF
-run systemctl restart systemd-journald
-info "日志最大占用 300M"
+SystemMaxUse=$JOURNAL_MAX_USE
+EOF_JOURNAL
 
-# ---------------------------------------------------------------------
-# 9. 时区 + 时间同步
-# ---------------------------------------------------------------------
-step "时区与时间同步"
-run timedatectl set-timezone "$TIMEZONE" || warn "设置时区失败: $TIMEZONE"
-
-if ! systemctl is-active --quiet systemd-timesyncd 2>/dev/null \
-   && ! systemctl is-active --quiet chrony 2>/dev/null \
-   && ! systemctl is-active --quiet chronyd 2>/dev/null; then
-    if run apt-get install "${APT_OPTS[@]}" chrony; then
-        run systemctl enable --now chrony
-        info "已安装并启用 chrony"
-    else
-        warn "时间同步服务安装失败"
-    fi
+if run systemctl restart systemd-journald; then
+    info "journald 磁盘上限: $JOURNAL_MAX_USE"
 else
-    run timedatectl set-ntp true
-    info "时间同步服务已在运行"
+    warn "重启 systemd-journald 失败，请查看日志。"
 fi
 
 # ---------------------------------------------------------------------
-# 10. 旧版脚本残留清理
+# 9. Timezone + NTP
 # ---------------------------------------------------------------------
-step "清理旧版脚本残留"
+
+step "时区与时间同步"
+
+if command -v timedatectl >/dev/null 2>&1; then
+
+    if run timedatectl set-timezone "$TIMEZONE"; then
+        info "时区已设置为 $TIMEZONE"
+    else
+        warn "设置时区失败: $TIMEZONE"
+    fi
+
+else
+    warn "未找到 timedatectl，跳过时区设置。"
+fi
+
+if systemctl is-active --quiet systemd-timesyncd 2>/dev/null \
+   || systemctl is-active --quiet chrony 2>/dev/null \
+   || systemctl is-active --quiet chronyd 2>/dev/null; then
+
+    run timedatectl set-ntp true || true
+
+    info "时间同步服务已在运行。"
+
+else
+
+    if command -v apt-get >/dev/null 2>&1; then
+
+        if run apt-get install "${APT_OPTS[@]}" chrony; then
+
+            if unit_exists chrony; then
+                run systemctl enable --now chrony || true
+
+            elif unit_exists chronyd; then
+                run systemctl enable --now chronyd || true
+            fi
+
+            info "已安装并启用 chrony。"
+
+        else
+            warn "chrony 安装失败，请查看日志。"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------
+# 10. Old residue cleanup
+# ---------------------------------------------------------------------
+
+step "清理旧版 vps-init / RPS 残留"
+
 cleaned=0
-if [[ -f /etc/rc.local ]] && grep -qE 'rps\.sh|rdate|sysctl -p /etc/sysctl\.conf' /etc/rc.local; then
+
+if [[ -f /etc/rc.local ]] \
+   && grep -Eq \
+      'rps\.sh|rdate|sysctl -p /etc/sysctl\.conf' \
+      /etc/rc.local; then
+
     backup /etc/rc.local
-    sed -i -E '/rps\.sh|rdate|sysctl -p \/etc\/sysctl\.conf/d' /etc/rc.local
+
+    sed -i -E \
+        '/rps\.sh|rdate|sysctl -p \/etc\/sysctl\.conf/d' \
+        /etc/rc.local
+
     cleaned=1
 fi
-if [[ -f /root/rps.sh ]]; then
-    backup /root/rps.sh
-    rm -f /root/rps.sh
+
+for f in \
+    /root/rps.sh \
+    /usr/local/sbin/rps-setup.sh; do
+
+    if [[ -e "$f" ]]; then
+        backup "$f"
+        rm -f "$f"
+        cleaned=1
+    fi
+done
+
+if [[ -f /etc/systemd/system/rps.service ]]; then
+
+    run systemctl disable --now rps.service || true
+
+    backup /etc/systemd/system/rps.service
+
+    rm -f /etc/systemd/system/rps.service
+
     cleaned=1
 fi
-if [[ -f /root/.bashrc ]] && grep -qE '^[[:space:]]*alias (nload|banping|unbanping|is|ic|dropcache)=' /root/.bashrc; then
+
+# 清理旧版 root bashrc 中的脚本别名
+if [[ -f /root/.bashrc ]] \
+   && grep -Eq \
+      '^[[:space:]]*alias (nload|banping|unbanping|is|ic|dropcache)=' \
+      /root/.bashrc; then
+
     backup /root/.bashrc
-    sed -i -E '/^[[:space:]]*alias (nload|banping|unbanping|is|ic|dropcache)=/d' /root/.bashrc
+
+    sed -i -E \
+        '/^[[:space:]]*alias (nload|banping|unbanping|is|ic|dropcache)=/d' \
+        /root/.bashrc
+
     cleaned=1
 fi
-[[ $cleaned -eq 1 ]] && info "已清理 rc.local / .bashrc / rps.sh 中的旧条目" || info "无残留"
+
+if [[ "$cleaned" -eq 1 ]]; then
+    info "已清理旧残留。"
+else
+    info "未发现旧残留。"
+fi
 
 # ---------------------------------------------------------------------
-# 11. 命令别名 / 函数
+# 11. Shell helpers
 # ---------------------------------------------------------------------
-cat >/etc/profile.d/99-vps-init.sh <<'EOF'
-# Generated by vps-init
-case $- in *i*) ;; *) return 0 ;; esac
+
+step "Shell 辅助命令"
+
+cat >"$PROFILE_FILE" <<'EOF_PROFILE'
+# Generated by vps-init.
+# Loaded for interactive shells only.
+
+case $- in
+    *i*)
+        ;;
+    *)
+        return 0
+        ;;
+esac
 
 alias nload='nload -i 2048000 -o 2048000'
 alias is='iperf3 -s'
 alias ic='iperf3 -c'
 alias dropcache='sync && echo 3 > /proc/sys/vm/drop_caches'
 
-# 禁 ping / 解禁 ping (立即生效并持久化)
+# Disable/restore ICMP echo replies.
+# These are opt-in convenience commands.
+
 banping() {
-    printf 'net.ipv4.icmp_echo_ignore_all=1\nnet.ipv4.icmp_echo_ignore_broadcasts=1\nnet.ipv4.icmp_ignore_bogus_error_responses=1\n' >/etc/sysctl.d/98-banping.conf
-    sysctl -p /etc/sysctl.d/98-banping.conf
+
+    cat >/etc/sysctl.d/98-vps-init-banping.conf <<'EOF_BANPING'
+# Generated by vps-init banping()
+
+net.ipv4.icmp_echo_ignore_all=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+EOF_BANPING
+
+    sysctl -p /etc/sysctl.d/98-vps-init-banping.conf
 }
+
 unbanping() {
-    rm -f /etc/sysctl.d/98-banping.conf
-    sysctl -w net.ipv4.icmp_echo_ignore_all=0 net.ipv4.icmp_echo_ignore_broadcasts=1 net.ipv4.icmp_ignore_bogus_error_responses=1
+
+    rm -f /etc/sysctl.d/98-vps-init-banping.conf
+
+    sysctl -w \
+        net.ipv4.icmp_echo_ignore_all=0 \
+        >/dev/null
+
+    sysctl -w \
+        net.ipv4.icmp_echo_ignore_broadcasts=1 \
+        >/dev/null
+
+    sysctl -w \
+        net.ipv4.icmp_ignore_bogus_error_responses=1 \
+        >/dev/null
 }
-EOF
-info "别名已写入 /etc/profile.d/99-vps-init.sh (nload / is / ic / dropcache / banping / unbanping)"
+EOF_PROFILE
+
+info "已写入 $PROFILE_FILE"
+info "可用: nload / is / ic / dropcache / banping / unbanping"
 
 # ---------------------------------------------------------------------
-# 12. 验证汇总
+# 12. Verification
 # ---------------------------------------------------------------------
-PASS=0; FAIL=0
-check() {  # check "描述" "实际值" "期望值"
-    if [[ "$2" == "$3" ]]; then
-        echo -e "  ${green}✔${plain} $1: $2"; PASS=$((PASS + 1))
+
+step "验证汇总"
+
+PASS=0
+FAIL=0
+
+check_eq() {
+
+    local label="$1"
+    local actual="$2"
+    local expected="$3"
+
+    if [[ "$actual" == "$expected" ]]; then
+
+        echo -e \
+            "  ${green}✔${plain} $label: $actual"
+
+        PASS=$((PASS + 1))
+
     else
-        echo -e "  ${red}✘${plain} $1: $2 (期望 $3)"; FAIL=$((FAIL + 1))
+
+        echo -e \
+            "  ${red}✘${plain} $label: $actual (期望 $expected)"
+
+        FAIL=$((FAIL + 1))
     fi
 }
 
-echo
-echo "============================================================"
-echo " 验证汇总"
-echo "============================================================"
-check "默认队列算法 qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null)" "fq"
-if [[ "$HAS_BBR" == "1" ]]; then
-    check "拥塞控制" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" "bbr"
+QDISC="$(
+    sysctl -n \
+        net.core.default_qdisc \
+        2>/dev/null || true
+)"
+
+check_eq \
+    "默认 qdisc" \
+    "$QDISC" \
+    "fq"
+
+CC="$(
+    sysctl -n \
+        net.ipv4.tcp_congestion_control \
+        2>/dev/null || true
+)"
+
+if [[ "$BBR_AVAILABLE" == "1" ]]; then
+
+    check_eq \
+        "拥塞控制" \
+        "$CC" \
+        "bbr"
+
 else
-    echo -e "  ${yellow}-${plain} 拥塞控制: 内核不支持 BBR, 当前 $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+
+    echo -e \
+        "  ${yellow}-${plain} 拥塞控制: 当前内核无 BBR ($CC)"
+
 fi
-if [[ "$ENABLE_FORWARD" == "1" ]]; then
-    check "IPv4 转发" "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" "1"
-fi
-check "IPv6 转发" "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null)" "0"
-check "rp_filter" "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)" "0"
-check "tcp_fastopen" "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)" "3"
-check "时区" "$(timedatectl show -p Timezone --value 2>/dev/null)" "$TIMEZONE"
+
+check_eq \
+    "IPv4 转发" \
+    "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)" \
+    "$ENABLE_FORWARD"
+
+check_eq \
+    "IPv6 转发" \
+    "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)" \
+    "0"
+
+check_eq \
+    "rp_filter" \
+    "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || true)" \
+    "$(
+        [[ "${DISABLE_RP_FILTER:-0}" == "1" ]] \
+        && echo 0 \
+        || echo 1
+    )"
+
+check_eq \
+    "tcp_fastopen" \
+    "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || true)" \
+    "3"
+
+check_eq \
+    "tcp_mtu_probing" \
+    "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || true)" \
+    "1"
+
+check_eq \
+    "时区" \
+    "$(timedatectl show -p Timezone --value 2>/dev/null || true)" \
+    "$TIMEZONE"
+
 if [[ "$MAKE_SWAP" == "1" ]]; then
-    sw=$(free -m | awk '/^Swap:/{print $2}')
-    [[ "${sw:-0}" -gt 0 ]] && check "Swap(MB)" "$sw" "$sw" || check "Swap(MB)" "0" ">0"
+
+    SWAP_MB="$(
+        awk '/^SwapTotal:/{printf "%d", $2/1024}' \
+        /proc/meminfo 2>/dev/null || echo 0
+    )"
+
+    if [[ "${SWAP_MB:-0}" -gt 0 ]]; then
+
+        echo -e \
+            "  ${green}✔${plain} Swap: ${SWAP_MB} MiB"
+
+        PASS=$((PASS + 1))
+
+    else
+
+        echo -e \
+            "  ${yellow}-${plain} Swap: 未启用（容器/文件系统可能不支持）"
+
+    fi
 fi
-if [[ "$ENABLE_RPS" == "1" && -f /etc/systemd/system/vps-init-rps.service ]]; then
-    check "RPS 服务" "$(systemctl is-active vps-init-rps.service 2>/dev/null)" "active"
+
+if [[ "$SET_LIMITS" == "1" ]]; then
+
+    if [[ -f "$LIMITS_FILE" ]]; then
+
+        echo -e \
+            "  ${green}✔${plain} limits.d: $LIMITS_FILE"
+
+        PASS=$((PASS + 1))
+
+    else
+
+        echo -e \
+            "  ${red}✘${plain} limits.d 文件不存在"
+
+        FAIL=$((FAIL + 1))
+    fi
+
+    if [[ -f "$SYSTEMD_LIMITS_FILE" ]]; then
+
+        echo -e \
+            "  ${green}✔${plain} systemd limits: $SYSTEMD_LIMITS_FILE"
+
+        PASS=$((PASS + 1))
+
+    else
+
+        echo -e \
+            "  ${red}✘${plain} systemd limits 文件不存在"
+
+        FAIL=$((FAIL + 1))
+    fi
 fi
-echo "  当前时间: $(date -R)"
-echo
-echo "  通过 ${PASS} 项, 失败 ${FAIL} 项"
+
+if [[ "$ENABLE_RPS" == "1" && -f "$RPS_UNIT" ]]; then
+
+    RPS_STATE="$(
+        systemctl is-active \
+            vps-init-rps.service \
+            2>/dev/null || true
+    )"
+
+    check_eq \
+        "RPS 服务" \
+        "$RPS_STATE" \
+        "active"
+fi
+
+JOURNAL_STATE="$(
+    systemctl show \
+        systemd-journald \
+        -p ActiveState \
+        --value \
+        2>/dev/null || true
+)"
+
+if [[ "$JOURNAL_STATE" == "active" ]]; then
+
+    echo -e \
+        "  ${green}✔${plain} systemd-journald: active"
+
+    PASS=$((PASS + 1))
+
+else
+
+    echo -e \
+        "  ${yellow}-${plain} systemd-journald: $JOURNAL_STATE"
+
+fi
+
+if [[ -f /var/run/reboot-required ]]; then
+
+    warn "系统提示需要重启 (/var/run/reboot-required)。本脚本不会自动重启。"
+
+fi
+
+# ---------------------------------------------------------------------
+# Final
+# ---------------------------------------------------------------------
 
 echo
+
 echo "============================================================"
-echo -e " ${green}初始化完成${plain}"
+echo -e " ${green}vps-init ${VERSION} 完成${plain}"
 echo "============================================================"
-echo " 配置备份 : $BACKUP_DIR"
-echo " 详细日志 : $LOG"
+
+echo "配置文件 : $SYSCTL_FILE"
+echo "备份目录 : $BACKUP_DIR"
+echo "日志文件 : $LOG"
+echo "通过     : $PASS"
+echo "失败     : $FAIL"
+
 echo
-echo " 提示:"
-echo "  1. 重新登录 SSH 后, ulimit 对新会话生效; 已运行的服务需重启才会应用新的 nofile 限制"
-echo "  2. 本脚本不会自动重启服务器"
-if [[ -f /var/run/reboot-required ]]; then
-    warn "系统提示需要重启 (/var/run/reboot-required)"
-fi
-[[ $FAIL -gt 0 ]] && warn "有 ${FAIL} 项验证未通过, 请查看上方结果与日志"
+
+echo "重要提示:"
+echo "  1. SSH 新会话才能看到新的 ulimit；已有服务通常需要重启才会继承新的 LimitNOFILE。"
+echo "  2. 默认不启用 IPv4 转发；中转/NAT/VPN 请使用 ENABLE_FORWARD=1。"
+echo "  3. 非对称路由/多网卡中转可使用 DISABLE_RP_FILTER=1。"
+echo "  4. 默认不会修改 /etc/sysctl.conf，也不会卸载防火墙或云厂商组件。"
+echo "  5. RPS 只在软件分流可能有意义时启用；硬件 RX 队列足够时会主动跳过。"
+echo "  6. 本脚本不会自动重启服务器。"
+
 exit 0
