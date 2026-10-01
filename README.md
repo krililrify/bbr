@@ -40,35 +40,79 @@
 
 ---
 
-# 快速开始
+## 快速开始
 
-推荐先下载并检查脚本：
+你可以选择**直接运行**，也可以先下载脚本并检查内容后再运行。
+
+### 方式一：直接运行
+
+如果你已经确认脚本来源可信，可以直接执行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/krililrify/bbr/main/init.sh)
+```
+
+这种方式无需下载文件，直接获取 GitHub `main` 分支中的最新版本并运行。
+
+### 方式二：下载后检查
+
+如果希望在运行前查看脚本内容，可以先下载：
 
 ```bash
 curl -fsSL -o init.sh https://raw.githubusercontent.com/krililrify/bbr/main/init.sh
+```
+
+查看脚本：
+
+```bash
 less init.sh
 ```
 
-确认没有问题后：
+确认没有问题后运行：
+
+```bash
+bash init.sh
+```
+
+也可以使用：
 
 ```bash
 chmod +x init.sh
-bash init.sh
+./init.sh
 ```
 
-或者：
+> `less init.sh` 和 `chmod +x init.sh` 都不是必须步骤。
+> `bash init.sh` 可以直接运行脚本，不需要执行权限。
+
+### 查看帮助
+
+直接查看帮助：
 
 ```bash
-bash init.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/krililrify/bbr/main/init.sh) --help
 ```
 
-查看帮助：
+如果已经下载脚本：
 
 ```bash
 bash init.sh --help
 ```
 
----
+### 推荐
+
+**普通 VPS：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/krililrify/bbr/main/init.sh)
+```
+
+**生产环境或希望确认脚本内容：**
+
+```bash
+curl -fsSL -o init.sh https://raw.githubusercontent.com/krililrify/bbr/main/init.sh
+less init.sh
+bash init.sh
+```
 
 # 默认行为
 
